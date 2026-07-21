@@ -24,7 +24,6 @@ CPU 负责 T2 求解，GPU 负责 MACVO 神经网络前端。没有 CUDA GPU 时
 ```bash
 git clone https://github.com/MANB0/macvo-realtime-t2-vio.git
 cd macvo-realtime-t2-vio
-git switch codex/realtime-minimal
 bash Scripts/bootstrap_conda.sh macvo-t2
 conda activate macvo-t2
 ```
