@@ -1,0 +1,90 @@
+Common:
+  device: cuda
+Odometry:
+  args:
+    device: cuda
+    edgewidth: 32
+    imu_gravity_rp_acc_tol: 0.12
+    imu_gravity_rp_correction_gain: 0.0
+    imu_gravity_rp_window: 24
+    imu_legacy_gyro_prior_enable: false
+    imu_legacy_gyro_sign:
+    - 1.0
+    - 1.0
+    - 1.0
+    imu_pose_fusion_alpha: 0.5
+    imu_pose_fusion_enable: false
+    imu_rot_prior_enable: false
+    imu_rot_prior_std: 0.012
+    imu_sigma_acc: 0.028
+    imu_sigma_acc_w: 0.001
+    imu_sigma_gyro: 0.012
+    imu_sigma_gyro_w: 0.0005
+    imu_trans_prior_enable: false
+    mapping: true
+    match_cov_default: 0.25
+    num_point: 200
+    profile: false
+  cov:
+    obs:
+      args:
+        device: cuda
+        kernel_size: 31
+        match_cov_default: 0.25
+        min_depth_cov: 0.05
+        min_flow_cov: 0.25
+      type: MatchCovariance
+  frontend:
+    args:
+      dec_dtype: bf16
+      decoder_depth: 12
+      device: cuda
+      enc_dtype: fp16
+      enforce_positive_disparity: false
+      weight: ./Model/MACVO_FrontendCov.pth
+    type: CUDAGraph_FlowFormerCovFrontend
+  keyframe:
+    args: null
+    type: AllKeyframe
+  keypoint:
+    args:
+      device: cuda
+      kernel_size: 7
+      mask_width: 32
+      max_match_cov: 100.0
+    type: CovAwareSelector_NoDepth
+  mappoint:
+    args:
+      device: cuda
+      mask_width: 32
+      max_depth: 5.0
+      max_depth_cov: 0.005
+    type: MappingPointSelector
+  motion:
+    args: null
+    type: StaticMotionModel
+  name: MACVO-HoloOcean-IMU
+  optimizer:
+    args:
+      autodiff: false
+      device: cpu
+      graph_type: disp
+      imu_rot_prior: false
+      imu_trans_prior_scale: 0.05
+      parallel: true
+      post_imu_fusion_cov_scale: 1.0
+      post_imu_fusion_enable: false
+      post_imu_fusion_mode: none
+      post_imu_fusion_prepose_enable: false
+      post_imu_fusion_visual_rot_std: 0.035
+      post_imu_fusion_visual_trans_std: 0.08
+      uraf_lambda: 0.5
+      vectorize: true
+    type: TwoFrame_PGO
+  outlier:
+    args: null
+    type: CovarianceSanityFilter
+  postprocess:
+    args: null
+    type: MotionInterpolate
+Preprocess: null

@@ -1,0 +1,36 @@
+# Python/runtime caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local environments and editor state
+.venv/
+venv/
+.env
+.idea/
+.vscode/
+
+# Generated datasets, results, traces, and dashboards
+Results/
+Output/
+output/
+analysis_*/
+*.log
+*.trace.jsonl
+
+# Pretrained weights are downloaded from the upstream MAC-VO release.
+# The validated filenames and hashes remain recorded in
+# FROZEN_SOURCE_MANIFEST.sha256.
+Model/*.pth
+Model/*.pkl
+Model/*.pt
+Model/*.ckpt
+
+# Large local sensor data
+*.bag
+*.db3
+*.mp4
+*.avi
+

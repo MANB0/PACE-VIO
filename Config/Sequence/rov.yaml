@@ -1,0 +1,14 @@
+type: GeneralStereo
+name: rov
+args:
+  root: /home/admin1/dataset/260421/1
+
+  # Camera Calibration
+  camera:
+    fx: 3.555501231680637e+02
+    fy: 3.558306641144621e+02
+    cx: 3.402152953048657e+02
+    cy: 1.945248502757250e+02
+  
+  bl: 0.12    # Unit: meter
+  format: jpg
