@@ -1,0 +1,111 @@
+Common:
+  device: cuda
+Odometry:
+  name: MACVO-Realtime-T2
+  args:
+    device: cuda
+    edgewidth: 32
+    mapping: false
+    profile: false
+    num_point: 200
+    match_cov_default: 0.25
+    visual_cache_mode: 'off'
+    visual_cache_path: null
+    pipeline_trace_path: null
+    imu_vio_gravity_handling: standard_local_frame_preintegration
+    imu_vio_gravity_pose_source: imu_integrated_estinit
+    imu_static_initialization_enable: true
+    imu_static_initialization_duration_s: 3.0
+    imu_static_sigma_multiplier: 5.0
+    imu_static_gyro_mean_norm_max: 0.03
+    imu_static_acc_norm_error_max: 0.6
+    imu_gravity_rp_acc_tol: 0.12
+    imu_gravity_rp_correction_gain: 0.0
+    imu_gravity_rp_window: 24
+    imu_legacy_gyro_prior_enable: false
+    imu_legacy_gyro_sign: [1.0, 1.0, 1.0]
+    imu_pose_fusion_alpha: 0.5
+    imu_pose_fusion_enable: false
+    imu_rot_prior_enable: true
+    imu_rot_prior_std: 0.012
+    imu_sigma_acc: 0.028
+    imu_sigma_acc_w: 0.001
+    imu_sigma_gyro: 0.012
+    imu_sigma_gyro_w: 0.0005
+    imu_trans_prior_enable: true
+    imu_trans_prior_mode: imu_velocity_composed
+  frontend:
+    type: CUDAGraph_FlowFormerCovFrontend
+    args:
+      device: cuda
+      weight: ./Model/MACVO_FrontendCov.pth
+      enc_dtype: fp16
+      dec_dtype: bf16
+      decoder_depth: 12
+      enforce_positive_disparity: false
+  keypoint:
+    type: CovAwareSelector_NoDepth
+    args:
+      device: cuda
+      kernel_size: 7
+      mask_width: 32
+      max_match_cov: 100.0
+  cov:
+    obs:
+      type: MatchCovariance
+      args:
+        device: cuda
+        kernel_size: 31
+        match_cov_default: 0.25
+        min_depth_cov: 0.05
+        min_flow_cov: 0.25
+  keyframe:
+    type: AllKeyframe
+    args: null
+  mappoint:
+    type: MappingPointSelector
+    args:
+      device: cuda
+      mask_width: 32
+      max_depth: 5.0
+      max_depth_cov: 0.005
+  motion:
+    type: StaticMotionModel
+    args: null
+  optimizer:
+    type: TwoFrame_PGO
+    args:
+      device: cpu
+      parallel: true
+      autodiff: true
+      graph_type: disp
+      vectorize: true
+      imu_rot_prior: true
+      imu_trans_prior_scale: 0.05
+      post_imu_fusion_enable: false
+      post_imu_fusion_mode: dua
+      post_imu_fusion_cov_scale: 1.0
+      post_imu_fusion_prepose_enable: false
+      post_imu_fusion_visual_rot_std: 0.035
+      post_imu_fusion_visual_trans_std: 0.08
+      uraf_lambda: 0.5
+      imu_factor_mode: two_state_fixed_lag
+      two_state_visual_factor_mode: compressed_uvd
+      two_state_warm_start: macvo_pose
+      two_state_max_iterations: 20
+      two_state_cpu_threads: 4
+      two_state_visual_huber_delta: 3.0
+      two_state_uvd_huber_delta: 0.1
+      two_state_initial_pose_translation_std: 1.0e-5
+      two_state_initial_pose_rotation_std: 1.0e-5
+      two_state_initial_velocity_std: 0.05
+      two_state_initial_acc_bias_std: 0.2
+      two_state_initial_gyro_bias_std: 0.02
+      two_state_cross_edge_rank_aware_imu_whitening: false
+  outlier:
+    type: CovarianceSanityFilter
+    args: null
+  postprocess:
+    type: MotionInterpolate
+    args: null
+Preprocess: null

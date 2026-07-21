@@ -1,0 +1,19 @@
+name: realtime_stereo_imu
+type: GeneralStereoIMU
+args:
+  root: /absolute/path/to/dataset
+  batch_root: /absolute/path/to
+  scene: dataset
+  format: png
+  pose_output_frame: NWU
+  gravity: 9.81
+  auto_estimate_time_offset: true
+  imu_time_offset_ns: 0
+  imu_window_ns: 100000000
+  imu_fallback_max_dt_ns: -1
+  bl: 0.225
+  camera:
+    fx: 320.0
+    fy: 320.0
+    cx: 320.0
+    cy: 240.0

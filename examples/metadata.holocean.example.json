@@ -1,0 +1,55 @@
+{
+  "dataset": {
+    "scene_name": "example",
+    "timestamp_unit": "ns",
+    "camera_rate_hz": 30,
+    "imu_rate_hz": 100
+  },
+  "camera": {
+    "image_width": 640,
+    "image_height": 480,
+    "fx": 320.0,
+    "fy": 320.0,
+    "cx": 320.0,
+    "cy": 240.0,
+    "baseline_m": 0.225,
+    "camera_model": "pinhole",
+    "distortion_model": "none"
+  },
+  "imu": {
+    "rate_hz": 100,
+    "frame": "FLU",
+    "acc_unit": "m/s^2",
+    "gyro_unit": "rad/s",
+    "acc_includes_gravity": true,
+    "gravity_m_s2": 9.8,
+    "AccelSigma": 0.141258,
+    "AngVelSigma": 0.0182898,
+    "AccelBiasSigma": 2.2289819577630798e-05,
+    "AngVelBiasSigma": 2.0661287673327623e-06,
+    "sigma_unit": "per-sample standard deviation",
+    "bias_sigma_unit": "per-tick bias random-walk increment standard deviation",
+    "bias_random_walk_update_hz": 300
+  },
+  "extrinsics": {
+    "T_body_imu": {
+      "translation_body_nwu_m": [-0.097, -0.07, 0.06]
+    },
+    "T_body_camera": {
+      "translation_body_nwu_m": [0.32, 0.11, 0.155]
+    },
+    "T_imu_camera": {
+      "translation_body_nwu_m": [0.417, 0.18, 0.095]
+    }
+  },
+  "coordinate_convention": {
+    "export_world_frame": "NWU (x-forward, y-left, z-up)",
+    "body_frame": "NWU (x-forward, y-left, z-up)",
+    "camera_frame": "body NWU, aligned",
+    "imu_measurement_frame": "FLU"
+  },
+  "time_synchronization": {
+    "timestamp_unit": "ns",
+    "camera_imu_time_offset_ns": 0
+  }
+}

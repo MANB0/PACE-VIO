@@ -1,4 +1,4 @@
-pypose >= 0.6.8
+pypose==0.9.5
 opencv-python-headless
 evo
 matplotlib==3.8.4
@@ -10,15 +10,13 @@ einops
 timm==0.9.12
 rerun-sdk==0.21.0
 yacs
-# torch
 numpy<2.0.0
 pyyaml
 wandb
-# torchvision
 pillow
 scipy
 flow_vis
 h5py
 xformers==0.0.27.post2
-# tensorrt
 onnx
+pytest

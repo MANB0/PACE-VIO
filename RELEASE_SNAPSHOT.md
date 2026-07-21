@@ -1,4 +1,4 @@
-# Validated real-time T2 snapshot
+# Validated real-time T2 snapshot and rollback point
 
 This private repository is a code-only release of the MACVO + IMU real-time
 T2 pipeline frozen on 2026-07-21.
@@ -15,10 +15,11 @@ T2 pipeline frozen on 2026-07-21.
   pan/zoom/reset controls, pipeline status lights, and a draggable replay
   timeline that works while new frames continue to arrive.
 
-The principal entry points are:
+The minimal branch entry points are:
 
-- `Scripts/run_real_t2_pipeline.py`
-- `Scripts/run_progress_dashboard.py`
+- `Scripts/run_realtime_t2.py`
+- `Scripts/check_runtime.py`
+- `Scripts/download_models.py`
 - `Utility/LiveDashboard.py`
 - `Utility/TwoStateVIO.py`
 - `Utility/CompressedUVDFactorCache.py`
@@ -32,28 +33,24 @@ The regression contract is in:
 - Frozen source files: 576
 - Original source archive SHA-256:
   `6cb095a62184aeedc8014cbfe24716ab8d18d8af42ad3e16aa4ab300051da7b3`
-- Per-file hashes: `FROZEN_SOURCE_MANIFEST.sha256`
+- The full source tree and its per-file manifest remain on the rollback tag.
 
-The two pretrained model files are intentionally not stored in Git because
-one exceeds GitHub's normal 100 MB object limit. Download them using the links
-in the upstream `README.md` and place them at:
+The only production model is intentionally not stored in Git. Download and
+verify it with `python Scripts/download_models.py`:
 
 - `Model/MACVO_FrontendCov.pth`
-- `Model/MACVO_posenet.pkl`
 
-Their exact validated hashes remain in `FROZEN_SOURCE_MANIFEST.sha256`.
+Validated model SHA-256:
+`bec6edd7e195bab863132f1e9659cdd26e6eaeae7cfd24a626828de294cf5b3a`.
 
 ## Verification
 
 ```bash
-pytest -q -o addopts= Scripts/UnitTest/test_live_t2_raw_contract.py
+pytest -q
 ```
 
-The frozen environment reports `5 passed`. The `addopts` override disables the
-repository-wide jaxtyping import hook, whose installed Typeguard version cannot
-parse the legacy shape annotation syntax during collection.
+The frozen environment reports `5 passed`.
 
-This snapshot does not include datasets, generated results, or model weights.
-The field-dataset conversion helper and sequence description present in the
-frozen tree are retained, but they do not modify or participate in the
-validated real-time T2 production path.
+The full pre-trim source remains on `main` and the immutable rollback tag
+`realtime-t2-full-20260721`. This branch does not include datasets, generated
+results, model weights, or historical diagnostic scripts.
