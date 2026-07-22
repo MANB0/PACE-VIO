@@ -74,7 +74,12 @@ def test_dashboard_committed_publish_uses_committed_index_and_matching_raw_pose(
 
     system = SimpleNamespace(
         graph=SimpleNamespace(frames=Frames()),
-        Optimizer=SimpleNamespace(last_pair_diagnostics={"frame_idx": 1}),
+        Optimizer=SimpleNamespace(last_pair_diagnostics={
+            "frame_idx": 1,
+            "vio_backend": "isam2",
+            "isam2_state_count": 2,
+            "isam2_history_revision": True,
+        }),
         _live_macvo_raw_poses={1: raw},
         _live_macvo_raw_last_diagnostics={"available": True, "frame_idx": 1},
         _pipeline_pending=None,
@@ -103,6 +108,9 @@ def test_dashboard_committed_publish_uses_committed_index_and_matching_raw_pose(
     # and paired that committed state with frame 1's independent raw state.
     assert max(abs(value) for value in payload["committed"]) < 1.0e-12
     assert sum(value * value for value in payload["raw"]) > 1.0
+    assert [
+        item["frame_idx"] for item in payload["committed_history_revision"]
+    ] == [0, 1]
 
 
 def test_dashboard_imu_history_survives_committed_stage_without_frame_payload():
@@ -187,6 +195,34 @@ def test_dashboard_replay_stereo_is_separate_from_live_state_history():
     assert replay["stereo_images"] == image0
     assert [entry["frame_idx"] for entry in state["history"]] == [0, 1]
     assert all("stereo_images" not in entry for entry in state["history"])
+
+
+def test_dashboard_history_revision_replaces_committed_points_by_frame_index():
+    store = LiveStateStore(max_history=6)
+    for frame_idx in range(3):
+        store.publish({
+            "frame_idx": frame_idx,
+            "timestamp_ns": frame_idx * 100,
+            "raw": [float(frame_idx), 0.0, 0.0],
+            "committed": [float(frame_idx), 1.0, 0.0],
+        })
+
+    store.publish({
+        "frame_idx": 2,
+        "timestamp_ns": 200,
+        "committed": [2.0, 2.0, 0.0],
+        "committed_history_revision": [
+            {"frame_idx": 0, "timestamp_ns": 0, "committed": [0.0, 3.0, 0.0]},
+            {"frame_idx": 1, "timestamp_ns": 100, "committed": [1.0, 3.0, 0.0]},
+            {"frame_idx": 2, "timestamp_ns": 200, "committed": [2.0, 3.0, 0.0]},
+        ],
+    })
+
+    state = store.snapshot()
+    assert [entry["frame_idx"] for entry in state["history"]] == [0, 1, 2]
+    assert [entry["committed"][1] for entry in state["history"]] == [3.0, 3.0, 2.0]
+    assert [entry["raw"][0] for entry in state["history"]] == [0.0, 1.0, 2.0]
+    assert "committed_history_revision" not in state
 
 
 def test_online_t2_compression_uses_visual_optimum_and_sets_warm_start():

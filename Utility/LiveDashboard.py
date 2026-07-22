@@ -136,15 +136,17 @@ function setStageLights(s){
   let vioLevel='red',vioText='waiting';
   if(!s.static_initialized){vioLevel='amber';vioText='IMU initializing';}
   else if(committed!==null){const lag=raw===null?0:Math.max(0,raw-committed);vioLevel=lag<=1?'green':'amber';vioText='frame '+committed+(lag?' · lag '+lag:'');}
-  $('stage-lights').innerHTML=signal('MACVO frontend',frontendLevel,frontendText)+signal('T2 VIO',vioLevel,vioText);
+  const backend=s.optimizer?.backend||'two_state';
+  $('stage-lights').innerHTML=signal('MACVO frontend',frontendLevel,frontendText)+signal('VIO · '+backend,vioLevel,vioText);
 }
 function setMetrics(s){
   const c=s.current||{}; const p=c.position||[];
   setStageLights(s);
-  const rows=[['Frame',s.frame_idx],['Time',fmt((s.timestamp_ns||0)*1e-9,3)+' s'],['Static init',s.static_initialized?'done':'active'],['IMU samples',s.imu_recent?.length||s.static_sample_count||0],['Frontend',fmt(s.frontend_ms,1)+' ms'],['Backend',fmt(s.backend_ms,1)+' ms'],['Position',vec(p,3)]];
+  const d=s.optimizer||{};
+  const rows=[['Frame',s.frame_idx],['Time',fmt((s.timestamp_ns||0)*1e-9,3)+' s'],['Static init',s.static_initialized?'done':'active'],['IMU samples',s.imu_recent?.length||s.static_sample_count||0],['Frontend',fmt(s.frontend_ms,1)+' ms'],['Backend',String(d.backend||'two_state')+' · '+fmt(s.backend_ms,1)+' ms'],['History revision',d.history_revision?('yes · '+(d.state_count??'')+' states'):('no · '+(d.state_count??'')+' states')],['Position',vec(p,3)]];
   $('metrics').innerHTML=rows.map(r=>'<div class="metric"><div class="k">'+r[0]+'</div><div class="v">'+r[1]+'</div></div>').join('');
   $('state').textContent='position  '+vec(c.position,5)+'\nvelocity  '+vec(c.velocity,5)+'\nacc bias  '+vec(c.acc_bias,6)+'\ngyro bias '+vec(c.gyro_bias,6)+'\nquaternion '+vec(c.orientation,6);
-  const d=s.optimizer||{},rs=s.raw_solver||{}; $('diag').textContent='cost total '+fmt(d.cost_total,4)+'\npose cost  '+fmt(d.pose_cost,4)+'\nIMU cost   '+fmt(d.imu_cost,4)+'\np/v cost   '+fmt(d.bias_cost,4)+'\niterations '+(d.iterations??'—')+'\nvisual path '+(d.visual_action||'—')+'\ncompression '+(rs.t2_compression_source||'—')+'\nstatic ZUPT '+(s.static_zupt_active?'active':'inactive');
+  const rs=s.raw_solver||{}; $('diag').textContent='cost total '+fmt(d.cost_total,4)+'\npose cost  '+fmt(d.pose_cost,4)+'\nIMU cost   '+fmt(d.imu_cost,4)+'\np/v cost   '+fmt(d.bias_cost,4)+'\niterations '+(d.iterations??'—')+'\nbackend '+(d.backend||'two_state')+'\nupdate '+fmt(d.update_ms,3)+' ms\nvisual path '+(d.visual_action||'—')+'\ncompression '+(rs.t2_compression_source||'—')+'\nstatic ZUPT '+(s.static_zupt_active?'active':'inactive');
   const ct=s.contract||{}; $('contract').textContent='world frame: '+(ct.world_frame||'NWU')+'\nreference: '+(ct.reference_point||'IMU origin')+'\norigin: '+(ct.origin||'first valid IMU pose')+'\npose source: '+(ct.pose_source||'T_WI = T_WC * T_CI');
   $('meta').textContent=(s.meta?.project||'MACVO + VIO')+' · '+(s.meta?.scene||'scene')+' · '+(s.meta?.mode||'real pipeline');
 }
@@ -236,6 +238,21 @@ class LiveStateStore:
         frame_idx = payload.get("frame_idx")
         if frame_idx is not None:
             with self._lock:
+                snapshot = dict(payload)
+                history_revision = snapshot.pop("committed_history_revision", None) or []
+                for revised in history_revision:
+                    revised_index = int(revised["frame_idx"])
+                    revised_entry = self._history.get(revised_index)
+                    if revised_entry is None:
+                        revised_entry = {
+                            "frame_idx": revised_index,
+                            "timestamp_ns": revised.get("timestamp_ns"),
+                        }
+                        self._history[revised_index] = revised_entry
+                    elif revised.get("timestamp_ns") is not None:
+                        revised_entry["timestamp_ns"] = revised["timestamp_ns"]
+                    if revised.get("committed") is not None:
+                        revised_entry["committed"] = revised["committed"]
                 entry = self._history.get(int(frame_idx))
                 if entry is None:
                     entry = {
@@ -257,14 +274,13 @@ class LiveStateStore:
                         "timestamp_ns": payload.get("timestamp_ns"),
                         "stereo_images": stereo,
                     }
-                history_items = list(self._history.values())[-self._max_history:]
+                history_items = [self._history[key] for key in sorted(self._history)][-self._max_history:]
                 self._history = {int(item["frame_idx"]): item for item in history_items}
                 retained = set(self._history)
                 self._replay = {
                     index: replay for index, replay in self._replay.items()
                     if index in retained
                 }
-                snapshot = dict(payload)
                 snapshot["history"] = history_items
                 snapshot["updated_at"] = time.time()
                 self._state = _finite(snapshot)
@@ -570,7 +586,31 @@ class LiveDashboard:
             "bias_cost": _scalar(opt.get("energy_pv_weighted")),
             "iterations": _scalar(opt.get("two_state_solver_iterations")),
             "visual_action": opt.get("visual_pose_gate_action"),
+            "backend": opt.get("vio_backend", "two_state"),
+            "update_ms": _scalar(opt.get("isam2_update_ms")),
+            "state_count": _scalar(opt.get("isam2_state_count")),
+            "history_revision": bool(opt.get("isam2_history_revision", False)),
         }
+        committed_history_revision = None
+        if (
+            stage == "vio_committed"
+            and diag["backend"] == "isam2"
+            and diag["history_revision"]
+            and diag["state_count"] is not None
+        ):
+            state_count = max(0, int(diag["state_count"]))
+            first_index = max(0, index - state_count + 1)
+            committed_history_revision = []
+            for revised_index in range(first_index, index + 1):
+                revised_pose = self._pose_imu_nwu(system, revised_index)
+                if revised_pose is None:
+                    continue
+                revised_timestamp = int(frames["time_ns"][revised_index].item())
+                committed_history_revision.append({
+                    "frame_idx": revised_index,
+                    "timestamp_ns": revised_timestamp,
+                    "committed": revised_pose[0],
+                })
         pending = getattr(system, "_pipeline_pending", None) or {}
         static_diag = getattr(system, "_imu_static_init_diag", {}) or {}
         stereo_images = self._encode_stereo(frame, timestamp_ns)
@@ -598,6 +638,7 @@ class LiveDashboard:
             "contract": self._contract(),
             "raw_solver": getattr(system, "_live_macvo_raw_last_diagnostics", {}),
             "imu_recent": list(getattr(self, "_imu_recent", ())),
+            "committed_history_revision": committed_history_revision,
         }
         return payload
 

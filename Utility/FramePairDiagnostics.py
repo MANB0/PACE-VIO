@@ -25,6 +25,11 @@ CSV_HEADER = [
     "two_state_solver_convergence_reason", "two_state_final_step_norm",
     "two_state_final_gradient_inf_norm", "two_state_solver_accepted_steps",
     "two_state_solver_rejected_steps",
+    "vio_backend", "isam2_update_ms", "isam2_state_count",
+    "isam2_history_revision",
+    "isam2_initial_pose_mismatch_norm",
+    "isam2_initial_velocity_mismatch_norm",
+    "isam2_initial_bias_mismatch_norm",
     # ── Estimated inter-frame motion ──
     "est_delta_x", "est_delta_y", "est_delta_z",
     "est_delta_t_norm", "est_delta_R_angle",

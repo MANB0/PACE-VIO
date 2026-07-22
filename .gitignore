@@ -4,6 +4,7 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+build/
 
 # Local environments and editor state
 .venv/
@@ -33,4 +34,3 @@ Model/*.ckpt
 *.db3
 *.mp4
 *.avi
-

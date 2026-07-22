@@ -23,6 +23,9 @@ T_GraphInput  = T.TypeVar("T_GraphInput", bound=DataclassInstance)
 T_Context     = T.TypeVar("T_Context")
 T_GraphOutput = T.TypeVar("T_GraphOutput", bound=DataclassInstance)
 
+_OPTIMIZER_CONTROL = "__optimizer_control__"
+_OPTIMIZER_FINALIZE = "finalize"
+
 
 def move_dataclass_to_local(obj: T_GraphInput) -> T_GraphInput:
     data_dict: dict = tensor_safe_asdict(obj)   # pyright: ignore
@@ -86,7 +89,13 @@ class IOptimizer(ABC, T.Generic[T_GraphInput, T_Context, T_GraphOutput], ConfigT
             # Spawn child process
             self.child_proc = ctx.Process(
                 target=IOptimizerParallelWorker,
-                args=(config, self.init_context, self._optimize, self.child_conn),
+                args=(
+                    config,
+                    self.init_context,
+                    self._optimize,
+                    self._finalize_context,
+                    self.child_conn,
+                ),
             )
             assert self.child_proc is not None
             self.child_proc.start()
@@ -114,7 +123,14 @@ class IOptimizer(ABC, T.Generic[T_GraphInput, T_Context, T_GraphOutput], ConfigT
         updated context and result.
         """
         ...
-    
+
+    @staticmethod
+    def _finalize_context(
+        context: T_Context,
+    ) -> tuple[T_Context, T_GraphOutput | None]:
+        """Return a final backend snapshot without consuming a new measurement."""
+        return context, None
+
     def get_graph_data(self, global_map: VisualMap, frame_idx: torch.Tensor, 
                        observations: torch.Tensor | None = None, edges: torch.Tensor | None = None) -> T_GraphInput:
         raise NotImplementedError("The used optimizer did not provide default factory method."
@@ -133,6 +149,7 @@ class IOptimizer(ABC, T.Generic[T_GraphInput, T_Context, T_GraphOutput], ConfigT
         self.context, self.optimize_res = self._optimize(self.context, graph_data)
 
     def __get_output_sequential(self) -> T_GraphOutput | None:
+        self.has_opt_job = False
         return self.optimize_res
 
     ## Parallel Version
@@ -151,8 +168,10 @@ class IOptimizer(ABC, T.Generic[T_GraphInput, T_Context, T_GraphOutput], ConfigT
                     raise RuntimeError("Optimizer child process exited unexpectedly!")
                 pass
             
-            graph_res: T_GraphOutput = self.main_conn.recv()
-            graph_res_local = move_dataclass_to_local(graph_res)
+            graph_res: T_GraphOutput | None = self.main_conn.recv()
+            graph_res_local = (
+                None if graph_res is None else move_dataclass_to_local(graph_res)
+            )
             del graph_res
             self.has_opt_job = False
             return graph_res_local
@@ -230,6 +249,32 @@ class IOptimizer(ABC, T.Generic[T_GraphInput, T_Context, T_GraphOutput], ConfigT
 
         self.write_graph_data(graph_res_local, global_map)
 
+    def finalize_map(self, global_map: VisualMap) -> T_GraphOutput | None:
+        """Write one final complete backend snapshot into ``global_map``.
+
+        The caller should first commit any pending measurement job with
+        :meth:`write_map`. This method never adds a new factor.
+        """
+        if self.has_opt_job:
+            raise RuntimeError(
+                "cannot finalize optimizer while a measurement job is pending; "
+                "call write_map() first"
+            )
+
+        if self.is_parallel_mode:
+            assert self.main_conn is not None
+            assert self.child_proc and self.child_proc.is_alive()
+            self.main_conn.send((_OPTIMIZER_CONTROL, _OPTIMIZER_FINALIZE))
+            self.has_opt_job = True
+            graph_res_local = self.__get_output_parallel()
+        else:
+            assert self.context is not None
+            self.context, graph_res_local = self._finalize_context(self.context)
+            self.optimize_res = graph_res_local
+
+        self.write_graph_data(graph_res_local, global_map)
+        return graph_res_local
+
     def get_result(self) -> T_GraphOutput | None:
         if self.is_parallel_mode:
             return self.__get_output_parallel()
@@ -245,6 +290,9 @@ def IOptimizerParallelWorker(
     config: SimpleNamespace,
     init_context: T.Callable[[SimpleNamespace,], T_Context],
     optimize: T.Callable[[T_Context, T_GraphInput], tuple[T_Context, T_GraphOutput]],
+    finalize_context: T.Callable[
+        [T_Context], tuple[T_Context, T_GraphOutput | None]
+    ],
     child_conn: Conn_Type,
 ):
     Logger.write("info", "OptimizationParallelWorker started")
@@ -256,7 +304,11 @@ def IOptimizerParallelWorker(
     while True:
         if not child_conn.poll(timeout=0.1): continue
         
-        graph_args: T_GraphInput = child_conn.recv()
+        graph_args: T_GraphInput | tuple[str, str] = child_conn.recv()
+        if graph_args == (_OPTIMIZER_CONTROL, _OPTIMIZER_FINALIZE):
+            context, graph_res = finalize_context(context)
+            child_conn.send(graph_res)
+            continue
         graph_args_local = move_dataclass_to_local(graph_args)
         del graph_args
         

@@ -230,6 +230,19 @@ class StaticImuInitialization:
     failure_reason: str = ""
 
 
+@dataclass(frozen=True)
+class AdaptiveStaticImuDecision:
+    initialization: StaticImuInitialization
+    ready: bool
+    timed_out: bool
+    recent_stationary: bool
+    gyro_bias_sem_max: float
+    gravity_direction_sem_rad: float
+    gyro_mean_drift_norm: float
+    gravity_direction_drift_rad: float
+    failure_reason: str = ""
+
+
 def _minimal_rotation_between_unit_vectors(
     source: torch.Tensor,
     target: torch.Tensor,
@@ -397,6 +410,181 @@ def estimate_static_imu_initialization(
         acc_std=acc_std.float(),
         gyro_std=gyro_std.float(),
         stationary=len(reasons) == 0,
+        failure_reason="; ".join(reasons),
+    )
+
+
+def evaluate_adaptive_static_imu_initialization(
+    time_ns: torch.Tensor,
+    acc_body: torch.Tensor,
+    gyro_body: torch.Tensor,
+    initial_body_to_world: pp.LieTensor | torch.Tensor,
+    gravity: float,
+    *,
+    min_duration_s: float = 1.0,
+    max_duration_s: float = 8.0,
+    window_s: float = 0.25,
+    stable_hold_s: float = 0.75,
+    target_gyro_bias_sem: float = 1.2e-3,
+    target_gravity_direction_sem_rad: float = 3.0e-3,
+    gyro_mean_norm_max: float = 0.03,
+    gyro_std_max: float | list[float] | tuple[float, ...] | torch.Tensor = 0.1,
+    acc_norm_error_max: float = 0.5,
+    acc_std_max: float | list[float] | tuple[float, ...] | torch.Tensor = 0.8,
+) -> AdaptiveStaticImuDecision:
+    """Decide when a startup static interval contains sufficient information.
+
+    The decision is based only on IMU measurements. It accepts a prefix once
+    the complete prefix and a recent hold interval are stationary, the bias and
+    gravity-direction standard errors meet their targets, and two recent
+    sub-windows agree. It does not claim to detect an exact physical motion
+    onset when that motion is below the sensor noise floor.
+    """
+    if float(min_duration_s) <= 0.0:
+        raise ValueError("adaptive static min_duration_s must be > 0")
+    if float(max_duration_s) < float(min_duration_s):
+        raise ValueError("adaptive static max_duration_s must be >= min_duration_s")
+    if float(window_s) <= 0.0:
+        raise ValueError("adaptive static window_s must be > 0")
+    if float(stable_hold_s) < 2.0 * float(window_s):
+        raise ValueError("adaptive static stable_hold_s must be at least 2 * window_s")
+    if float(target_gyro_bias_sem) <= 0.0:
+        raise ValueError("adaptive target_gyro_bias_sem must be > 0")
+    if float(target_gravity_direction_sem_rad) <= 0.0:
+        raise ValueError("adaptive target_gravity_direction_sem_rad must be > 0")
+
+    stamps = time_ns.reshape(-1).long()
+    acc = acc_body.reshape(-1, 3)
+    gyro = gyro_body.reshape(-1, 3)
+    initialization = estimate_static_imu_initialization(
+        time_ns=stamps,
+        acc_body=acc,
+        gyro_body=gyro,
+        initial_body_to_world=initial_body_to_world,
+        gravity=gravity,
+        min_duration_s=min_duration_s,
+        gyro_mean_norm_max=gyro_mean_norm_max,
+        gyro_std_max=gyro_std_max,
+        acc_norm_error_max=acc_norm_error_max,
+        acc_std_max=acc_std_max,
+    )
+    duration_s = float(initialization.duration_s)
+    timed_out = duration_s + 1e-9 >= float(max_duration_s)
+    if stamps.numel() < 2:
+        return AdaptiveStaticImuDecision(
+            initialization=initialization,
+            ready=False,
+            timed_out=timed_out,
+            recent_stationary=False,
+            gyro_bias_sem_max=float("inf"),
+            gravity_direction_sem_rad=float("inf"),
+            gyro_mean_drift_norm=float("inf"),
+            gravity_direction_drift_rad=float("inf"),
+            failure_reason="insufficient IMU samples",
+        )
+
+    hold_start_ns = int(stamps[-1].item()) - int(round(float(stable_hold_s) * 1e9))
+    recent_mask = stamps >= hold_start_ns
+    recent_time = stamps[recent_mask]
+    recent_acc = acc[recent_mask]
+    recent_gyro = gyro[recent_mask]
+    recent_duration_s = (
+        float((recent_time[-1] - recent_time[0]).item()) * 1e-9
+        if recent_time.numel() >= 2
+        else 0.0
+    )
+    recent_complete = recent_duration_s + 1e-9 >= float(stable_hold_s) * 0.95
+    recent = estimate_static_imu_initialization(
+        time_ns=recent_time,
+        acc_body=recent_acc,
+        gyro_body=recent_gyro,
+        initial_body_to_world=initial_body_to_world,
+        gravity=gravity,
+        min_duration_s=float(stable_hold_s) * 0.95,
+        gyro_mean_norm_max=gyro_mean_norm_max,
+        gyro_std_max=gyro_std_max,
+        acc_norm_error_max=acc_norm_error_max,
+        acc_std_max=acc_std_max,
+    )
+
+    first_end_ns = hold_start_ns + int(round(float(window_s) * 1e9))
+    last_start_ns = int(stamps[-1].item()) - int(round(float(window_s) * 1e9))
+    first_mask = recent_mask & (stamps <= first_end_ns)
+    last_mask = stamps >= last_start_ns
+
+    def _window(mask: torch.Tensor) -> StaticImuInitialization:
+        return estimate_static_imu_initialization(
+            time_ns=stamps[mask],
+            acc_body=acc[mask],
+            gyro_body=gyro[mask],
+            initial_body_to_world=initial_body_to_world,
+            gravity=gravity,
+            min_duration_s=float(window_s) * 0.9,
+            gyro_mean_norm_max=gyro_mean_norm_max,
+            gyro_std_max=gyro_std_max,
+            acc_norm_error_max=acc_norm_error_max,
+            acc_std_max=acc_std_max,
+        )
+
+    first_window = _window(first_mask)
+    last_window = _window(last_mask)
+    gyro_mean_drift_norm = float(
+        (last_window.gyro_mean - first_window.gyro_mean).norm().item()
+    )
+
+    first_up = first_window.acc_mean.double()
+    last_up = last_window.acc_mean.double()
+    first_up = first_up / first_up.norm().clamp(min=1e-12)
+    last_up = last_up / last_up.norm().clamp(min=1e-12)
+    gravity_direction_drift_rad = float(
+        torch.acos(torch.dot(first_up, last_up).clamp(-1.0, 1.0)).item()
+    )
+
+    sample_count = max(int(initialization.sample_count), 1)
+    gyro_bias_sem_max = float(
+        initialization.gyro_std.max().item() / sample_count**0.5
+    )
+    gravity_direction_sem_rad = float(
+        initialization.acc_std.max().item()
+        / (sample_count**0.5 * max(abs(float(gravity)), 1e-9))
+    )
+    gyro_drift_limit = max(
+        4.0 * float(target_gyro_bias_sem),
+        0.2 * float(gyro_mean_norm_max),
+    )
+    gravity_drift_limit = 4.0 * float(target_gravity_direction_sem_rad)
+    recent_stationary = bool(
+        recent_complete
+        and recent.stationary
+        and first_window.stationary
+        and last_window.stationary
+    )
+
+    reasons: list[str] = []
+    if duration_s + 1e-9 < float(min_duration_s):
+        reasons.append("minimum duration not reached")
+    if not initialization.stationary:
+        reasons.append(initialization.failure_reason or "complete interval is not stationary")
+    if not recent_stationary:
+        reasons.append("recent hold interval is not continuously stationary")
+    if gyro_bias_sem_max > float(target_gyro_bias_sem):
+        reasons.append("gyro bias standard error above target")
+    if gravity_direction_sem_rad > float(target_gravity_direction_sem_rad):
+        reasons.append("gravity direction standard error above target")
+    if gyro_mean_drift_norm > gyro_drift_limit:
+        reasons.append("recent gyro mean is not stable")
+    if gravity_direction_drift_rad > gravity_drift_limit:
+        reasons.append("recent gravity direction is not stable")
+
+    return AdaptiveStaticImuDecision(
+        initialization=initialization,
+        ready=len(reasons) == 0,
+        timed_out=timed_out,
+        recent_stationary=recent_stationary,
+        gyro_bias_sem_max=gyro_bias_sem_max,
+        gravity_direction_sem_rad=gravity_direction_sem_rad,
+        gyro_mean_drift_norm=gyro_mean_drift_norm,
+        gravity_direction_drift_rad=gravity_direction_drift_rad,
         failure_reason="; ".join(reasons),
     )
 

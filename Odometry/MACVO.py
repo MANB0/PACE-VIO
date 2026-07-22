@@ -31,6 +31,7 @@ from Utility.IMUKinematics import (
     compose_adaptive_fallback_pose,
     compose_translation_prior_by_mode,
     estimate_static_imu_initialization,
+    evaluate_adaptive_static_imu_initialization,
     gravity_for_world_frame,
     gravity_roll_pitch_aligned_rotation,
     gravity_is_standard_local_frame,
@@ -119,7 +120,15 @@ class MACVO(IOdometry[T_SensorFrame], ConfigTestable):
         imu_vio_velocity_feedback_enable=True,
         imu_vio_bias_feedback_enable=True,
         imu_static_initialization_enable=False,
-        imu_static_initialization_duration_s=3.0,
+        imu_static_initialization_mode=None,
+        imu_static_initialization_state_policy="estimated",
+        imu_static_initialization_duration_s=None,
+        imu_static_adaptive_min_duration_s=1.0,
+        imu_static_adaptive_max_duration_s=8.0,
+        imu_static_adaptive_window_s=0.25,
+        imu_static_adaptive_stable_hold_s=0.75,
+        imu_static_adaptive_target_gyro_bias_sem=1.2e-3,
+        imu_static_adaptive_target_gravity_direction_sem_rad=3.0e-3,
         imu_static_sigma_multiplier=5.0,
         imu_static_gyro_mean_norm_max=0.03,
         imu_static_acc_norm_error_max=0.6,
@@ -169,8 +178,74 @@ class MACVO(IOdometry[T_SensorFrame], ConfigTestable):
         )
         self.imu_vio_velocity_feedback_enable: bool = bool(imu_vio_velocity_feedback_enable)
         self.imu_vio_bias_feedback_enable: bool = bool(imu_vio_bias_feedback_enable)
-        self.imu_static_initialization_enable = bool(imu_static_initialization_enable)
-        self.imu_static_initialization_duration_s = float(imu_static_initialization_duration_s)
+        if imu_static_initialization_mode is None:
+            static_mode = "fixed" if bool(imu_static_initialization_enable) else "off"
+        else:
+            static_mode = str(imu_static_initialization_mode).strip().lower()
+        if static_mode not in {"fixed", "adaptive", "off"}:
+            raise ValueError(
+                "imu_static_initialization_mode must be fixed, adaptive or off; "
+                f"got {imu_static_initialization_mode!r}"
+            )
+        static_state_policy = str(imu_static_initialization_state_policy).strip().lower()
+        if static_state_policy not in {"estimated", "zero"}:
+            raise ValueError(
+                "imu_static_initialization_state_policy must be estimated or zero; "
+                f"got {imu_static_initialization_state_policy!r}"
+            )
+        if static_state_policy == "zero" and static_mode == "off":
+            raise ValueError(
+                "zero static initialization state policy requires fixed or adaptive mode"
+            )
+        if static_mode == "fixed":
+            if imu_static_initialization_duration_s is None:
+                raise ValueError(
+                    "fixed static initialization requires "
+                    "imu_static_initialization_duration_s"
+                )
+            if float(imu_static_initialization_duration_s) <= 0.0:
+                raise ValueError("fixed static initialization duration must be > 0")
+        if static_mode == "adaptive":
+            if float(imu_static_adaptive_min_duration_s) <= 0.0:
+                raise ValueError("adaptive static minimum duration must be > 0")
+            if float(imu_static_adaptive_max_duration_s) < float(
+                imu_static_adaptive_min_duration_s
+            ):
+                raise ValueError(
+                    "adaptive static maximum duration must be >= minimum duration"
+                )
+            if float(imu_static_adaptive_window_s) <= 0.0:
+                raise ValueError("adaptive static window must be > 0")
+            if float(imu_static_adaptive_stable_hold_s) < 2.0 * float(
+                imu_static_adaptive_window_s
+            ):
+                raise ValueError(
+                    "adaptive stable hold must be at least two detection windows"
+                )
+        self.imu_static_initialization_mode = static_mode
+        self.imu_static_initialization_state_policy = static_state_policy
+        self.imu_static_initialization_enable = static_mode != "off"
+        self.imu_static_initialization_duration_s = (
+            None
+            if imu_static_initialization_duration_s is None
+            else float(imu_static_initialization_duration_s)
+        )
+        self.imu_static_adaptive_min_duration_s = float(
+            imu_static_adaptive_min_duration_s
+        )
+        self.imu_static_adaptive_max_duration_s = float(
+            imu_static_adaptive_max_duration_s
+        )
+        self.imu_static_adaptive_window_s = float(imu_static_adaptive_window_s)
+        self.imu_static_adaptive_stable_hold_s = float(
+            imu_static_adaptive_stable_hold_s
+        )
+        self.imu_static_adaptive_target_gyro_bias_sem = float(
+            imu_static_adaptive_target_gyro_bias_sem
+        )
+        self.imu_static_adaptive_target_gravity_direction_sem_rad = float(
+            imu_static_adaptive_target_gravity_direction_sem_rad
+        )
         self.imu_static_sigma_multiplier = float(imu_static_sigma_multiplier)
         self.imu_static_gyro_mean_norm_max = float(imu_static_gyro_mean_norm_max)
         self.imu_static_acc_norm_error_max = float(imu_static_acc_norm_error_max)
@@ -227,7 +302,7 @@ class MACVO(IOdometry[T_SensorFrame], ConfigTestable):
         self._imu_attitude_world: pp.LieTensor | None = None
         self._imu_attitude_last_time_ns: int | None = None
         self._pending_imu_vio_factor: dict | None = None
-        self._imu_static_initialized = not self.imu_static_initialization_enable
+        self._imu_static_initialized = self.imu_static_initialization_mode == "off"
         self._imu_static_time_chunks: list[torch.Tensor] = []
         self._imu_static_acc_chunks: list[torch.Tensor] = []
         self._imu_static_gyro_chunks: list[torch.Tensor] = []
@@ -235,7 +310,17 @@ class MACVO(IOdometry[T_SensorFrame], ConfigTestable):
         self._imu_static_initial_rotation: pp.LieTensor | None = None
         self._imu_static_anchor_pose: pp.LieTensor | None = None
         self._imu_static_zupt_active = False
-        self._imu_static_init_diag: dict | None = None
+        self._imu_static_init_diag: dict | None = (
+            {
+                "mode": "off",
+                "stationary": False,
+                "duration_s": 0.0,
+                "sample_count": 0,
+                "status": "disabled",
+            }
+            if self._imu_static_initialized
+            else None
+        )
 
         # Modules
         self.Frontend = frontend
@@ -321,6 +406,7 @@ class MACVO(IOdometry[T_SensorFrame], ConfigTestable):
         self._visual_factor_diag_written_pairs: set[tuple[int, int]] = set()
         self._pair_counter: int = 0
         self._last_written_frame_idx: int = -1          # avoid duplicate rows
+        self._optimizer_finalize_summary: dict | None = None
         self._scene_name: str = ""
         self._method_name: str = ""
         self._gt_positions: dict | None = None           # {timestamp_ns: (x_nwu, y_nwu, z_nwu)}
@@ -458,7 +544,15 @@ class MACVO(IOdometry[T_SensorFrame], ConfigTestable):
             "imu_vio_velocity_feedback_enable": lambda b: isinstance(b, bool),
             "imu_vio_bias_feedback_enable": lambda b: isinstance(b, bool),
             "imu_static_initialization_enable": lambda b: isinstance(b, bool),
-            "imu_static_initialization_duration_s": lambda b: isinstance(b, (float, int)) and float(b) > 0.0,
+            "imu_static_initialization_mode": lambda s: str(s).strip().lower() in {"fixed", "adaptive", "off"},
+            "imu_static_initialization_state_policy": lambda s: str(s).strip().lower() in {"estimated", "zero"},
+            "imu_static_initialization_duration_s": lambda b: b is None or (isinstance(b, (float, int)) and float(b) > 0.0),
+            "imu_static_adaptive_min_duration_s": lambda b: isinstance(b, (float, int)) and float(b) > 0.0,
+            "imu_static_adaptive_max_duration_s": lambda b: isinstance(b, (float, int)) and float(b) > 0.0,
+            "imu_static_adaptive_window_s": lambda b: isinstance(b, (float, int)) and float(b) > 0.0,
+            "imu_static_adaptive_stable_hold_s": lambda b: isinstance(b, (float, int)) and float(b) > 0.0,
+            "imu_static_adaptive_target_gyro_bias_sem": lambda b: isinstance(b, (float, int)) and float(b) > 0.0,
+            "imu_static_adaptive_target_gravity_direction_sem_rad": lambda b: isinstance(b, (float, int)) and float(b) > 0.0,
             "imu_static_sigma_multiplier": lambda b: isinstance(b, (float, int)) and float(b) > 0.0,
             "imu_static_gyro_mean_norm_max": lambda b: isinstance(b, (float, int)) and float(b) >= 0.0,
             "imu_static_acc_norm_error_max": lambda b: isinstance(b, (float, int)) and float(b) >= 0.0,
@@ -1854,7 +1948,7 @@ class MACVO(IOdometry[T_SensorFrame], ConfigTestable):
         if self._imu_static_initialized:
             self._imu_static_zupt_active = False
             return False
-        if not self.imu_static_initialization_enable:
+        if self.imu_static_initialization_mode == "off":
             self._imu_static_initialized = True
             self._imu_static_zupt_active = False
             return False
@@ -1888,16 +1982,6 @@ class MACVO(IOdometry[T_SensorFrame], ConfigTestable):
         all_time = torch.cat(self._imu_static_time_chunks, dim=0)
         all_acc = torch.cat(self._imu_static_acc_chunks, dim=0)
         all_gyro = torch.cat(self._imu_static_gyro_chunks, dim=0)
-        required_end = int(all_time[0].item()) + int(round(self.imu_static_initialization_duration_s * 1e9))
-        if int(all_time[-1].item()) < required_end:
-            return True
-
-        end_index = int(torch.searchsorted(all_time, torch.tensor(required_end), right=False).item())
-        end_index = min(end_index + 1, int(all_time.numel()))
-        init_time = all_time[:end_index]
-        init_acc = all_acc[:end_index]
-        init_gyro = all_gyro[:end_index]
-
         measurement_rate_hz = float(getattr(frame, "imu_calib_measurement_rate_hz", 100.0))
         acc_density = getattr(frame, "imu_calib_acc_sigma", self.imu_sigma_acc)
         gyro_density = getattr(frame, "imu_calib_gyro_sigma", self.imu_sigma_gyro)
@@ -1913,27 +1997,133 @@ class MACVO(IOdometry[T_SensorFrame], ConfigTestable):
             floor=0.005,
             multiplier=self.imu_static_sigma_multiplier,
         )
-        result = estimate_static_imu_initialization(
-            time_ns=init_time,
-            acc_body=init_acc,
-            gyro_body=init_gyro,
-            initial_body_to_world=self._imu_static_initial_rotation,
-            gravity=gravity,
-            min_duration_s=self.imu_static_initialization_duration_s,
-            gyro_mean_norm_max=self.imu_static_gyro_mean_norm_max,
-            gyro_std_max=gyro_std_limit,
-            acc_norm_error_max=self.imu_static_acc_norm_error_max,
-            acc_std_max=acc_std_limit,
+
+        adaptive_diag: dict[str, T.Any] = {}
+        if self.imu_static_initialization_mode == "fixed":
+            assert self.imu_static_initialization_duration_s is not None
+            required_end = int(all_time[0].item()) + int(
+                round(self.imu_static_initialization_duration_s * 1e9)
+            )
+            if int(all_time[-1].item()) < required_end:
+                self._imu_static_init_diag = {
+                    "mode": "fixed",
+                    "status": "collecting",
+                    "stationary": None,
+                    "duration_s": float((all_time[-1] - all_time[0]).item()) * 1e-9,
+                    "required_duration_s": self.imu_static_initialization_duration_s,
+                    "sample_count": int(all_time.numel()),
+                }
+                return True
+
+            end_index = int(
+                torch.searchsorted(all_time, torch.tensor(required_end), right=False).item()
+            )
+            end_index = min(end_index + 1, int(all_time.numel()))
+            init_time = all_time[:end_index]
+            init_acc = all_acc[:end_index]
+            init_gyro = all_gyro[:end_index]
+            result = estimate_static_imu_initialization(
+                time_ns=init_time,
+                acc_body=init_acc,
+                gyro_body=init_gyro,
+                initial_body_to_world=self._imu_static_initial_rotation,
+                gravity=gravity,
+                min_duration_s=self.imu_static_initialization_duration_s,
+                gyro_mean_norm_max=self.imu_static_gyro_mean_norm_max,
+                gyro_std_max=gyro_std_limit,
+                acc_norm_error_max=self.imu_static_acc_norm_error_max,
+                acc_std_max=acc_std_limit,
+            )
+        else:
+            decision = evaluate_adaptive_static_imu_initialization(
+                time_ns=all_time,
+                acc_body=all_acc,
+                gyro_body=all_gyro,
+                initial_body_to_world=self._imu_static_initial_rotation,
+                gravity=gravity,
+                min_duration_s=self.imu_static_adaptive_min_duration_s,
+                max_duration_s=self.imu_static_adaptive_max_duration_s,
+                window_s=self.imu_static_adaptive_window_s,
+                stable_hold_s=self.imu_static_adaptive_stable_hold_s,
+                target_gyro_bias_sem=self.imu_static_adaptive_target_gyro_bias_sem,
+                target_gravity_direction_sem_rad=(
+                    self.imu_static_adaptive_target_gravity_direction_sem_rad
+                ),
+                gyro_mean_norm_max=self.imu_static_gyro_mean_norm_max,
+                gyro_std_max=gyro_std_limit,
+                acc_norm_error_max=self.imu_static_acc_norm_error_max,
+                acc_std_max=acc_std_limit,
+            )
+            result = decision.initialization
+            adaptive_diag = {
+                "ready": bool(decision.ready),
+                "timed_out": bool(decision.timed_out),
+                "recent_stationary": bool(decision.recent_stationary),
+                "gyro_bias_sem_max": float(decision.gyro_bias_sem_max),
+                "gravity_direction_sem_rad": float(decision.gravity_direction_sem_rad),
+                "gyro_mean_drift_norm": float(decision.gyro_mean_drift_norm),
+                "gravity_direction_drift_rad": float(
+                    decision.gravity_direction_drift_rad
+                ),
+            }
+            if not decision.ready:
+                self._imu_static_init_diag = {
+                    "mode": "adaptive",
+                    "status": "collecting" if not decision.timed_out else "failed",
+                    "stationary": bool(result.stationary),
+                    "duration_s": float(result.duration_s),
+                    "sample_count": int(result.sample_count),
+                    "failure_reason": decision.failure_reason,
+                    **adaptive_diag,
+                }
+                if decision.timed_out:
+                    if self.pipeline_trace_path:
+                        init_path = Path(self.pipeline_trace_path).with_name(
+                            "static_initialization.json"
+                        )
+                        init_path.write_text(
+                            json.dumps(self._imu_static_init_diag, indent=2),
+                            encoding="utf-8",
+                        )
+                    raise RuntimeError(
+                        "Adaptive static IMU initialization timed out: "
+                        f"{decision.failure_reason}; diagnostics={self._imu_static_init_diag}"
+                    )
+                return True
+            init_time = all_time
+            init_acc = all_acc
+            init_gyro = all_gyro
+
+        estimate_applied = self.imu_static_initialization_state_policy == "estimated"
+        applied_acc_bias = (
+            result.acc_bias.clone().float() if estimate_applied else torch.zeros(3, dtype=torch.float32)
+        )
+        applied_gyro_bias = (
+            result.gyro_bias.clone().float() if estimate_applied else torch.zeros(3, dtype=torch.float32)
+        )
+        applied_attitude = (
+            result.body_to_world.clone().float()
+            if estimate_applied
+            else pp.identity_SO3(dtype=torch.float32)
         )
         self._imu_static_init_diag = {
+            "mode": self.imu_static_initialization_mode,
+            "state_policy": self.imu_static_initialization_state_policy,
+            "estimate_applied": estimate_applied,
+            "status": "complete",
             "stationary": bool(result.stationary),
             "duration_s": float(result.duration_s),
             "sample_count": int(result.sample_count),
-            "acc_bias": result.acc_bias.tolist(),
-            "gyro_bias": result.gyro_bias.tolist(),
+            "estimated_acc_bias": result.acc_bias.tolist(),
+            "estimated_gyro_bias": result.gyro_bias.tolist(),
+            "estimated_body_to_world_rotvec": result.body_to_world.Log().tensor().tolist(),
+            "applied_acc_bias": applied_acc_bias.tolist(),
+            "applied_gyro_bias": applied_gyro_bias.tolist(),
+            "applied_body_to_world_rotvec": applied_attitude.Log().tensor().tolist(),
             "acc_std": result.acc_std.tolist(),
             "gyro_std": result.gyro_std.tolist(),
             "failure_reason": result.failure_reason,
+            **adaptive_diag,
         }
         if self.pipeline_trace_path:
             init_path = Path(self.pipeline_trace_path).with_name("static_initialization.json")
@@ -1947,18 +2137,23 @@ class MACVO(IOdometry[T_SensorFrame], ConfigTestable):
                 f"{result.failure_reason}; diagnostics={self._imu_static_init_diag}"
             )
 
-        self._imu_acc_bias = result.acc_bias.clone().float()
-        self._imu_gyro_bias = result.gyro_bias.clone().float()
+        self._imu_acc_bias = applied_acc_bias
+        self._imu_gyro_bias = applied_gyro_bias
         self._imu_vel_w = torch.zeros(3, dtype=torch.float32)
-        self._imu_attitude_world = result.body_to_world.clone().float()
+        self._imu_attitude_world = applied_attitude
         self._imu_last_frame_time_ns = int(init_time[-1].item())
         self._imu_attitude_last_time_ns = int(init_time[-1].item())
         self._imu_static_initialized = True
         Logger.write(
             "info",
             "Static IMU initialization complete: "
+            f"mode={self.imu_static_initialization_mode}, "
+            f"state_policy={self.imu_static_initialization_state_policy}, "
             f"duration={result.duration_s:.3f}s, samples={result.sample_count}, "
-            f"acc_bias={result.acc_bias.tolist()}, gyro_bias={result.gyro_bias.tolist()}",
+            f"estimated_acc_bias={result.acc_bias.tolist()}, "
+            f"estimated_gyro_bias={result.gyro_bias.tolist()}, "
+            f"applied_acc_bias={applied_acc_bias.tolist()}, "
+            f"applied_gyro_bias={applied_gyro_bias.tolist()}",
         )
         return True
 
@@ -2599,6 +2794,45 @@ class MACVO(IOdometry[T_SensorFrame], ConfigTestable):
             self._flush_pipeline_trace_pending(commit_ms)
             last_frame = self.prev_keyframe[0]
             self._write_frame_pair_diagnostics(last_frame, last_frame)
+            final_result = self.Optimizer.finalize_map(self.graph)
+            if final_result is not None:
+                final_frames = getattr(final_result, "window_frame_indices", None)
+                final_frame_list = (
+                    [int(value) for value in final_frames.reshape(-1).tolist()]
+                    if isinstance(final_frames, torch.Tensor)
+                    else []
+                )
+                self._optimizer_finalize_summary = {
+                    "schema_version": 1,
+                    "backend": str(getattr(final_result, "vio_backend", "unknown")),
+                    "reason": str(
+                        getattr(
+                            final_result,
+                            "two_state_solver_convergence_reason",
+                            "unknown",
+                        )
+                    ),
+                    "history_revision": bool(
+                        getattr(final_result, "isam2_history_revision", False)
+                    ),
+                    "writeback": str(
+                        getattr(final_result, "local_ba_writeback", "unknown")
+                    ),
+                    "state_count": int(
+                        getattr(final_result, "isam2_state_count", 0) or 0
+                    ),
+                    "first_frame": final_frame_list[0] if final_frame_list else None,
+                    "last_frame": final_frame_list[-1] if final_frame_list else None,
+                    "history_frame_count": len(final_frame_list),
+                    "snapshot_build_ms": 1000.0
+                    * float(
+                        getattr(final_result, "local_ba_optimize_total_s", 0.0)
+                        or 0.0
+                    ),
+                }
+                self._sync_optimized_vio_velocity_from_map()
+                for func in self.on_optimize_writeback:
+                    func(self)
         self.Optimizer.terminate()
         self.MapRefiner.elaborate_map(self.graph.frames)
         # Close diagnostics writer
@@ -2615,6 +2849,16 @@ class MACVO(IOdometry[T_SensorFrame], ConfigTestable):
         logs = getattr(self.Optimizer, "fusion_logs", None)
         if logs:
             saveto.path("fusion_log.json").write_text(json.dumps(logs, indent=2), encoding="utf-8")
+        if self._optimizer_finalize_summary is not None:
+            saveto.path("optimizer_finalize_summary.json").write_text(
+                json.dumps(
+                    self._optimizer_finalize_summary,
+                    indent=2,
+                    ensure_ascii=False,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
 
     def _close_visual_factor_diagnostics(self) -> None:
         if self._visual_factor_diag_stream is not None:
@@ -3593,6 +3837,19 @@ class MACVO(IOdometry[T_SensorFrame], ConfigTestable):
             ),
             two_state_solver_rejected_steps=opt_diag.get(
                 "two_state_solver_rejected_steps", ""
+            ),
+            vio_backend=opt_diag.get("vio_backend", "two_state"),
+            isam2_update_ms=opt_diag.get("isam2_update_ms", ""),
+            isam2_state_count=opt_diag.get("isam2_state_count", ""),
+            isam2_history_revision=int(bool(opt_diag.get("isam2_history_revision", False))),
+            isam2_initial_pose_mismatch_norm=opt_diag.get(
+                "isam2_initial_pose_mismatch_norm", ""
+            ),
+            isam2_initial_velocity_mismatch_norm=opt_diag.get(
+                "isam2_initial_velocity_mismatch_norm", ""
+            ),
+            isam2_initial_bias_mismatch_norm=opt_diag.get(
+                "isam2_initial_bias_mismatch_norm", ""
             ),
             est_delta_x=est_delta_x,
             est_delta_y=est_delta_y,

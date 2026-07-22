@@ -19,6 +19,8 @@ import yaml
 
 
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 BASE_ODOM = ROOT / "Config/Experiment/MACVO/MACVO_Realtime_T2.yaml"
 BASE_SEQUENCE = ROOT / "Config/Sequence/realtime_stereo_imu.yaml"
 DEFAULT_MODEL = ROOT / "Model/MACVO_FrontendCov.pth"
@@ -77,19 +79,36 @@ def configure_odom(
     model: Path,
     trace: Path,
     parallel: bool,
-    static_duration_s: float,
+    static_mode: str,
+    static_state_policy: str,
+    static_duration_s: float | None,
+    static_min_duration_s: float,
+    static_max_duration_s: float,
+    static_window_s: float,
+    static_stable_hold_s: float,
     cpu_threads: int,
+    vio_backend: str,
 ) -> None:
     cfg = load_yaml(BASE_ODOM)
     args = cfg["Odometry"]["args"]
     frontend = cfg["Odometry"]["frontend"]["args"]
     optimizer = cfg["Odometry"]["optimizer"]["args"]
     args["pipeline_trace_path"] = str(trace)
-    args["imu_static_initialization_enable"] = static_duration_s > 0.0
-    args["imu_static_initialization_duration_s"] = float(static_duration_s)
+    args.pop("imu_static_initialization_enable", None)
+    args["imu_static_initialization_mode"] = str(static_mode)
+    args["imu_static_initialization_state_policy"] = str(static_state_policy)
+    if static_duration_s is None:
+        args.pop("imu_static_initialization_duration_s", None)
+    else:
+        args["imu_static_initialization_duration_s"] = float(static_duration_s)
+    args["imu_static_adaptive_min_duration_s"] = float(static_min_duration_s)
+    args["imu_static_adaptive_max_duration_s"] = float(static_max_duration_s)
+    args["imu_static_adaptive_window_s"] = float(static_window_s)
+    args["imu_static_adaptive_stable_hold_s"] = float(static_stable_hold_s)
     frontend["weight"] = str(model)
     optimizer["parallel"] = bool(parallel)
     optimizer["two_state_cpu_threads"] = int(cpu_threads)
+    optimizer["two_state_backend"] = str(vio_backend)
     write_yaml(target, cfg)
 
 
@@ -117,6 +136,36 @@ def append_progress(path: Path, row: dict[str, object]) -> None:
         writer.writerow({field: row.get(field, "") for field in fields})
 
 
+def validate_static_initialization_options(args: argparse.Namespace) -> None:
+    if args.static_init_state_policy == "zero" and args.static_init_mode == "off":
+        raise ValueError(
+            "--static-init-state-policy zero requires fixed or adaptive static initialization"
+        )
+    if args.static_init_mode == "fixed":
+        if args.static_init_duration_s is None:
+            raise ValueError(
+                "--static-init-mode fixed requires --static-init-duration-s"
+            )
+        if args.static_init_duration_s <= 0.0:
+            raise ValueError("--static-init-duration-s must be > 0 in fixed mode")
+    elif args.static_init_duration_s is not None:
+        raise ValueError(
+            "--static-init-duration-s is valid only with --static-init-mode fixed"
+        )
+    if args.static_init_min_duration_s <= 0.0:
+        raise ValueError("--static-init-min-duration-s must be > 0")
+    if args.static_init_max_duration_s < args.static_init_min_duration_s:
+        raise ValueError(
+            "--static-init-max-duration-s must be >= --static-init-min-duration-s"
+        )
+    if args.static_init_window_s <= 0.0:
+        raise ValueError("--static-init-window-s must be > 0")
+    if args.static_init_stable_hold_s < 2.0 * args.static_init_window_s:
+        raise ValueError(
+            "--static-init-stable-hold-s must be at least 2 * --static-init-window-s"
+        )
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset", type=Path, required=True)
@@ -126,12 +175,43 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seq-from", type=int, default=0)
     parser.add_argument("--seq-to", type=int, default=-1, help="Exclusive stop; -1 runs all frames")
     parser.add_argument(
+        "--static-init-mode",
+        choices=("fixed", "adaptive", "off"),
+        default="adaptive",
+        help=(
+            "adaptive detects a sufficient stationary prefix; fixed requires "
+            "--static-init-duration-s; off assumes no stationary prefix"
+        ),
+    )
+    parser.add_argument(
         "--static-init-duration-s",
         type=float,
-        default=3.0,
-        help="Verified default is 3 s. Use 0 only when the dataset has no static prefix.",
+        default=None,
+        help="Required positive duration for --static-init-mode fixed only.",
     )
+    parser.add_argument(
+        "--static-init-state-policy",
+        choices=("estimated", "zero"),
+        default="estimated",
+        help=(
+            "estimated applies the detected attitude and biases; zero keeps the same "
+            "static boundary but starts VIO from identity attitude and zero biases"
+        ),
+    )
+    parser.add_argument("--static-init-min-duration-s", type=float, default=1.0)
+    parser.add_argument("--static-init-max-duration-s", type=float, default=8.0)
+    parser.add_argument("--static-init-window-s", type=float, default=0.25)
+    parser.add_argument("--static-init-stable-hold-s", type=float, default=0.75)
     parser.add_argument("--cpu-threads", type=int, default=4)
+    parser.add_argument(
+        "--vio-backend",
+        choices=("two_state", "isam2"),
+        default="two_state",
+        help=(
+            "two_state preserves the validated online T2 solver; isam2 consumes "
+            "the same compressed-UVD/IMU/bias factor packets incrementally"
+        ),
+    )
     parser.add_argument("--timeout", type=int, default=21600)
     parser.add_argument(
         "--live-display",
@@ -156,14 +236,25 @@ def main() -> int:
     inputs = validate_dataset(dataset)
     fmt = image_format(dataset)
 
-    if args.static_init_duration_s < 0.0:
-        raise ValueError("--static-init-duration-s must be >= 0")
+    validate_static_initialization_options(args)
     if args.cpu_threads < 1:
         raise ValueError("--cpu-threads must be >= 1")
     if not args.dry_run and not model.is_file():
         raise FileNotFoundError(
             f"Missing frontend model: {model}\n"
             "Run: python Scripts/download_models.py"
+        )
+    if args.vio_backend == "isam2":
+        from Utility.T2ISAM2Backend import IncrementalT2ISAM2Backend
+
+        IncrementalT2ISAM2Backend(
+            initial_prior_std={
+                "pose_translation_std": 1.0e-5,
+                "pose_rotation_std": 1.0e-5,
+                "velocity_std": 0.05,
+                "acc_bias_std": 0.2,
+                "gyro_bias_std": 0.02,
+            }
         )
 
     result_root = output / dataset.name
@@ -177,8 +268,15 @@ def main() -> int:
         model=model,
         trace=trace_path,
         parallel=args.mode == "pipeline",
+        static_mode=args.static_init_mode,
+        static_state_policy=args.static_init_state_policy,
         static_duration_s=args.static_init_duration_s,
+        static_min_duration_s=args.static_init_min_duration_s,
+        static_max_duration_s=args.static_init_max_duration_s,
+        static_window_s=args.static_init_window_s,
+        static_stable_hold_s=args.static_init_stable_hold_s,
         cpu_threads=args.cpu_threads,
+        vio_backend=args.vio_backend,
     )
     configure_sequence(sequence_path, dataset, fmt)
 
@@ -188,10 +286,18 @@ def main() -> int:
         "dataset": str(dataset),
         "mode": args.mode,
         "frontend": "live MACVO stereo frontend (no visual cache)",
-        "backend": "two_state_fixed_lag + compressed_uvd",
+        "backend": f"{args.vio_backend} + compressed_uvd T2 factor packets",
         "preintegration": "standard_local_frame_preintegration",
         "trajectory_reference": "IMU center for VIO output",
-        "static_initialization_duration_s": args.static_init_duration_s,
+        "static_initialization": {
+            "mode": args.static_init_mode,
+            "state_policy": args.static_init_state_policy,
+            "fixed_duration_s": args.static_init_duration_s,
+            "adaptive_min_duration_s": args.static_init_min_duration_s,
+            "adaptive_max_duration_s": args.static_init_max_duration_s,
+            "adaptive_window_s": args.static_init_window_s,
+            "adaptive_stable_hold_s": args.static_init_stable_hold_s,
+        },
         "ground_truth_available": optional_ref.is_file(),
         "input_sha256": {name: sha256(path) for name, path in inputs.items()},
     }
@@ -229,6 +335,7 @@ def main() -> int:
     print(f"Dataset: {dataset}")
     print(f"Output:  {result_root}")
     print(f"Mode:    {args.mode}")
+    print(f"Backend: {args.vio_backend}")
     print(f"Command: {shlex.join(command)}", flush=True)
     if args.live_display:
         print(f"Dashboard: http://{args.dashboard_host}:{args.dashboard_port}/", flush=True)

@@ -37,7 +37,14 @@ frame and uses metadata extrinsics so the committed VIO position is reported
 at the IMU center. Do not silently reuse this convention for a different
 sensor rig: update the metadata and validate the transform first.
 
-If a sequence has a verified static prefix, use the default three-second IMU
-initialization. For a sequence without a static prefix, pass
-`--static-init-duration-s 0`; this starts immediately with a weaker zero-bias,
-zero-velocity initialization and is not equivalent to static initialization.
+If a sequence has a static prefix, the default `adaptive` mode accepts it once
+stationarity, bias precision, gravity-direction precision and recent-window
+stability pass. Use `--static-init-mode fixed --static-init-duration-s <sec>`
+when an audited fixed interval is required. For a sequence without a static
+prefix, pass `--static-init-mode off`; this starts immediately with weaker
+zero-bias and zero-velocity initial values and is not equivalent to static
+initialization.
+
+For controlled ablation only, `--static-init-state-policy zero` keeps the
+detected fixed/adaptive boundary while discarding its estimated attitude and
+biases. The production default remains `estimated`.

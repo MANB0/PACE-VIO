@@ -262,6 +262,13 @@ class GraphOutput:
     two_state_final_gradient_inf_norm: float | None = None
     two_state_solver_accepted_steps: int | None = None
     two_state_solver_rejected_steps: int | None = None
+    vio_backend: str = "two_state"
+    isam2_update_ms: float | None = None
+    isam2_state_count: int | None = None
+    isam2_history_revision: bool = False
+    isam2_initial_pose_mismatch_norm: float | None = None
+    isam2_initial_velocity_mismatch_norm: float | None = None
+    isam2_initial_bias_mismatch_norm: float | None = None
     debug_trace: dict[str, T.Any] | None = None
 
 

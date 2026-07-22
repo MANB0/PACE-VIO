@@ -20,3 +20,4 @@ h5py
 xformers==0.0.27.post2
 onnx
 pytest
+pybind11>=2.11

@@ -14,8 +14,14 @@ Odometry:
     pipeline_trace_path: null
     imu_vio_gravity_handling: standard_local_frame_preintegration
     imu_vio_gravity_pose_source: imu_integrated_estinit
-    imu_static_initialization_enable: true
-    imu_static_initialization_duration_s: 3.0
+    imu_static_initialization_mode: adaptive
+    imu_static_initialization_state_policy: estimated
+    imu_static_adaptive_min_duration_s: 1.0
+    imu_static_adaptive_max_duration_s: 8.0
+    imu_static_adaptive_window_s: 0.25
+    imu_static_adaptive_stable_hold_s: 0.75
+    imu_static_adaptive_target_gyro_bias_sem: 0.0012
+    imu_static_adaptive_target_gravity_direction_sem_rad: 0.003
     imu_static_sigma_multiplier: 5.0
     imu_static_gyro_mean_norm_max: 0.03
     imu_static_acc_norm_error_max: 0.6
@@ -90,6 +96,7 @@ Odometry:
       post_imu_fusion_visual_trans_std: 0.08
       uraf_lambda: 0.5
       imu_factor_mode: two_state_fixed_lag
+      two_state_backend: two_state
       two_state_visual_factor_mode: compressed_uvd
       two_state_warm_start: macvo_pose
       two_state_max_iterations: 20
@@ -101,6 +108,10 @@ Odometry:
       two_state_initial_velocity_std: 0.05
       two_state_initial_acc_bias_std: 0.2
       two_state_initial_gyro_bias_std: 0.02
+      two_state_isam2_relinearize_threshold: 0.01
+      two_state_isam2_relinearize_skip: 1
+      two_state_isam2_covariance_floor: 1.0e-12
+      two_state_isam2_history_publish_interval: 30
       two_state_cross_edge_rank_aware_imu_whitening: false
   outlier:
     type: CovarianceSanityFilter

@@ -23,6 +23,8 @@ from Utility.IMUKinematics import (
     vio_preintegrated_covariance_matrix,
 )
 from Utility.RelativePoseFactorCache import camera_factor_to_body_factor
+from Utility.T2FactorPacket import T2FactorPacket
+from Utility.T2ISAM2Backend import IncrementalT2ISAM2Backend
 from Utility.TwoStateVIO import (
     ImuPreintegrationFactor,
     LinearizedUVDPoseFactor,
@@ -35,6 +37,7 @@ from Utility.TwoStateVIO import (
     linearize_uvd_relative_pose_factor,
     linearized_uvd_pose_factor_from_normal_equations,
     make_diagonal_prior,
+    state_boxminus,
     visual_whitened_residuals,
 )
 from Utility.TwoStateSamplingAwareVIO import (
@@ -2446,6 +2449,56 @@ class TwoFrame_PGO(IOptimizer[GraphInput, dict, GraphOutput]):
         ):
             torch.set_num_threads(two_state_cpu_threads)
 
+        visual_factor_mode = str(
+            getattr(config, "two_state_visual_factor_mode", "relative_pose")
+        ).strip().lower()
+        two_state_backend_name = str(
+            getattr(config, "two_state_backend", "two_state")
+        ).strip().lower()
+        if two_state_backend_name not in {"two_state", "isam2"}:
+            raise ValueError(
+                "two_state_backend must be either 'two_state' or 'isam2', "
+                f"got {two_state_backend_name!r}"
+            )
+        if two_state_backend_name == "isam2" and visual_factor_mode != "compressed_uvd":
+            raise ValueError(
+                "the incremental iSAM2 backend requires "
+                "two_state_visual_factor_mode='compressed_uvd'"
+            )
+        initial_prior_std = {
+            "pose_translation_std": float(
+                getattr(config, "two_state_initial_pose_translation_std", 1e-5)
+            ),
+            "pose_rotation_std": float(
+                getattr(config, "two_state_initial_pose_rotation_std", 1e-5)
+            ),
+            "velocity_std": float(
+                getattr(config, "two_state_initial_velocity_std", 0.05)
+            ),
+            "acc_bias_std": float(
+                getattr(config, "two_state_initial_acc_bias_std", 0.2)
+            ),
+            "gyro_bias_std": float(
+                getattr(config, "two_state_initial_gyro_bias_std", 0.02)
+            ),
+        }
+        isam2_backend = (
+            IncrementalT2ISAM2Backend(
+                initial_prior_std=initial_prior_std,
+                relinearize_threshold=float(
+                    getattr(config, "two_state_isam2_relinearize_threshold", 0.01)
+                ),
+                relinearize_skip=int(
+                    getattr(config, "two_state_isam2_relinearize_skip", 1)
+                ),
+                covariance_floor=float(
+                    getattr(config, "two_state_isam2_covariance_floor", 1.0e-12)
+                ),
+            )
+            if two_state_backend_name == "isam2"
+            else None
+        )
+
         match (config.autodiff, config.graph_type):
             case (True, "icp"):
                 PoseGraphClass = ICP_TwoframePGO
@@ -2486,6 +2539,18 @@ class TwoFrame_PGO(IOptimizer[GraphInput, dict, GraphOutput]):
                 int(getattr(config, "vio_causal_diagnostics_interval", 5)),
             ),
             "imu_factor_mode": imu_factor_mode,
+            "two_state_backend_name": two_state_backend_name,
+            "two_state_isam2_backend": isam2_backend,
+            "two_state_isam2_history_publish_interval": max(
+                1,
+                int(
+                    getattr(
+                        config,
+                        "two_state_isam2_history_publish_interval",
+                        30,
+                    )
+                ),
+            ),
             "two_state_solver": TwoStateVIOSolver(
                 max_iterations=int(getattr(config, "two_state_max_iterations", 20)),
                 initial_damping=float(getattr(config, "two_state_initial_damping", 1e-3)),
@@ -2539,23 +2604,11 @@ class TwoFrame_PGO(IOptimizer[GraphInput, dict, GraphOutput]):
                 )
                 or ""
             ).strip(),
-            "two_state_initial_prior_std": {
-                "pose_translation_std": float(
-                    getattr(config, "two_state_initial_pose_translation_std", 1e-5)
-                ),
-                "pose_rotation_std": float(
-                    getattr(config, "two_state_initial_pose_rotation_std", 1e-5)
-                ),
-                "velocity_std": float(getattr(config, "two_state_initial_velocity_std", 0.05)),
-                "acc_bias_std": float(getattr(config, "two_state_initial_acc_bias_std", 0.2)),
-                "gyro_bias_std": float(getattr(config, "two_state_initial_gyro_bias_std", 0.02)),
-            },
+            "two_state_initial_prior_std": initial_prior_std,
             "two_state_visual_huber_delta": float(
                 getattr(config, "two_state_visual_huber_delta", 3.0)
             ),
-            "two_state_visual_factor_mode": str(
-                getattr(config, "two_state_visual_factor_mode", "relative_pose")
-            ).strip().lower(),
+            "two_state_visual_factor_mode": visual_factor_mode,
             "two_state_warm_start": str(
                 getattr(config, "two_state_warm_start", "macvo_pose")
             ).strip().lower(),
@@ -2592,6 +2645,112 @@ class TwoFrame_PGO(IOptimizer[GraphInput, dict, GraphOutput]):
                 ),
             },
         }
+
+    @staticmethod
+    def _isam2_history_tensors(
+        context: dict,
+        history: list[tuple[int, NavigationState]] | None = None,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
+        backend = context.get("two_state_isam2_backend")
+        if not isinstance(backend, IncrementalT2ISAM2Backend) or not backend.initialized:
+            raise RuntimeError("iSAM2 history requested before backend initialization")
+        packet = context.get("two_state_last_factor_packet")
+        if not isinstance(packet, T2FactorPacket):
+            raise RuntimeError("iSAM2 history has no matching T2 factor packet")
+
+        history = backend.history() if history is None else history
+        if len(history) < 2:
+            raise RuntimeError("iSAM2 final history must contain at least two states")
+        frame_indices = torch.tensor(
+            [frame for frame, _ in history], dtype=torch.long
+        )
+        states = [state for _, state in history]
+        extrinsic_CI = pp.SE3(packet.extrinsic_CI.detach().cpu())
+        camera_poses = torch.cat(
+            [
+                (pp.SE3(state.pose_WB.detach().cpu()) @ extrinsic_CI.Inv()).tensor()
+                for state in states
+            ],
+            dim=0,
+        ).float()
+        velocities = torch.stack(
+            [state.velocity_W.detach().cpu() for state in states], dim=0
+        ).float()
+        acc_biases = torch.stack(
+            [state.acc_bias.detach().cpu() for state in states], dim=0
+        ).float()
+        gyro_biases = torch.stack(
+            [state.gyro_bias.detach().cpu() for state in states], dim=0
+        ).float()
+        return frame_indices, camera_poses, velocities, acc_biases, gyro_biases
+
+    @staticmethod
+    def _finalize_context(context: dict) -> tuple[dict, GraphOutput | None]:
+        if str(context.get("two_state_backend_name", "two_state")) != "isam2":
+            return context, None
+        backend = context.get("two_state_isam2_backend")
+        if not isinstance(backend, IncrementalT2ISAM2Backend) or not backend.initialized:
+            return context, None
+
+        started = time.perf_counter()
+        history = backend.history()
+        (
+            frame_indices,
+            camera_poses,
+            velocities,
+            acc_biases,
+            gyro_biases,
+        ) = TwoFrame_PGO._isam2_history_tensors(context, history)
+        frame_idx = int(frame_indices[-1].item())
+        from_idx = int(frame_indices[-2].item())
+        context["two_state_isam2_last_history_frame"] = frame_idx
+
+        output = GraphOutput(
+            motion=camera_poses[-1:].clone(),
+            from_idx=torch.tensor([from_idx], dtype=torch.long),
+            frame_idx=torch.tensor([frame_idx], dtype=torch.long),
+            velocity_world=velocities[-1].clone(),
+            acc_bias=acc_biases[-1].clone(),
+            gyro_bias=gyro_biases[-1].clone(),
+            imu_factor_mode="two_state_fixed_lag",
+            vio_factor_active=True,
+            vio_bias_state_active=True,
+            imu_residual_rows=5,
+            use_imu_rotation=True,
+            use_imu_translation=True,
+            window_frame_indices=frame_indices,
+            window_motions=camera_poses,
+            window_velocity_world=velocities,
+            window_acc_bias=acc_biases,
+            window_gyro_bias=gyro_biases,
+            local_ba_window_size=int(frame_indices.numel()),
+            local_ba_writeback="all_isam2_history",
+            local_ba_num_frames=int(frame_indices.numel()),
+            local_ba_num_edges=max(int(frame_indices.numel()) - 1, 0),
+            local_ba_num_visual_residual_blocks=0,
+            local_ba_graph_build_s=0.0,
+            local_ba_lm_s=0.0,
+            local_ba_refine_s=0.0,
+            local_ba_optimize_total_s=time.perf_counter() - started,
+            two_state_solver_converged=True,
+            two_state_solver_iterations=0,
+            two_state_solver_convergence_reason="isam2_final_history_snapshot",
+            two_state_final_step_norm=0.0,
+            two_state_final_gradient_inf_norm=0.0,
+            two_state_solver_accepted_steps=0,
+            two_state_solver_rejected_steps=0,
+            vio_backend="isam2",
+            isam2_update_ms=0.0,
+            isam2_state_count=int(backend.state_count),
+            isam2_history_revision=True,
+        )
+        return context, output
 
     @staticmethod
     def _refine_vio_vector_states(graph: FactorGraph, weight: torch.Tensor) -> float | None:
@@ -3625,6 +3784,19 @@ class TwoFrame_PGO(IOptimizer[GraphInput, dict, GraphOutput]):
                 "action": visual_action,
             }
         factor_build_s = time.perf_counter() - factor_build_start
+        factor_packet = None
+        if isinstance(visual, LinearizedUVDPoseFactor) and not use_cross_edge_sampling:
+            factor_packet = T2FactorPacket.create(
+                frame_i=from_idx,
+                frame_j=frame_idx,
+                state_i_initial=state_i,
+                state_j_initial=state_j,
+                imu=imu,
+                visual=visual,
+                extrinsic_CI=extrinsic_CI.tensor(),
+            )
+            context["two_state_last_factor_packet"] = factor_packet
+
         def solve_current_visual_factor():
             if use_cross_edge_sampling:
                 return solver.solve(
@@ -3640,6 +3812,19 @@ class TwoFrame_PGO(IOptimizer[GraphInput, dict, GraphOutput]):
                         optimize_gyro_bias=bool(context["two_state_optimize_gyro_bias"]),
                     )
                 )
+            if factor_packet is not None:
+                return solver.solve(
+                    factor_packet.to_two_state_problem(
+                        prior_i=prior,
+                        device=device,
+                        optimize_acc_bias=bool(
+                            context["two_state_optimize_acc_bias"]
+                        ),
+                        optimize_gyro_bias=bool(
+                            context["two_state_optimize_gyro_bias"]
+                        ),
+                    )
+                )
             return solver.solve(
                 TwoStateVIOProblem(
                     state_i=state_i,
@@ -3653,7 +3838,53 @@ class TwoFrame_PGO(IOptimizer[GraphInput, dict, GraphOutput]):
             )
 
         solve_start = time.perf_counter()
-        result = solve_current_visual_factor()
+        isam2_update = None
+        isam2_history_states = None
+        backend_name = str(context.get("two_state_backend_name", "two_state"))
+        if backend_name == "isam2":
+            if use_cross_edge_sampling:
+                raise ValueError("iSAM2 backend does not accept SA-v2 cross-edge packets")
+            if factor_packet is None:
+                raise ValueError("iSAM2 backend requires a compressed UVD factor packet")
+            isam2_backend = context.get("two_state_isam2_backend")
+            if not isinstance(isam2_backend, IncrementalT2ISAM2Backend):
+                raise RuntimeError("iSAM2 backend was not initialized in optimizer context")
+            isam2_update = isam2_backend.consume(factor_packet)
+            state_i_result = isam2_update.previous_state.to(device=device, dtype=dtype)
+            state_j_result = isam2_update.state.to(device=device, dtype=dtype)
+            state_step = state_boxminus(
+                state_j_result,
+                factor_packet.state_j_initial.to(device=device, dtype=dtype),
+            )
+            result = SimpleNamespace(
+                state_i=state_i_result,
+                state_j=state_j_result,
+                prior_j=None,
+                converged=True,
+                iterations=1,
+                initial_cost=float(isam2_update.total_edge_cost),
+                final_cost=float(isam2_update.total_edge_cost),
+                prior_cost=0.0,
+                imu_cost=float(isam2_update.imu_cost),
+                bias_cost=float(isam2_update.bias_cost),
+                visual_pose_cost=float(isam2_update.visual_cost),
+                final_step_norm=float(torch.linalg.vector_norm(state_step).item()),
+                final_gradient_inf_norm=0.0,
+                convergence_reason="isam2_incremental_update",
+                accepted_steps=1,
+                rejected_steps=0,
+            )
+            history_interval = int(
+                context.get("two_state_isam2_history_publish_interval", 30)
+            )
+            if (
+                isam2_backend.state_count <= 2
+                or (isam2_backend.state_count - 1) % history_interval == 0
+            ):
+                isam2_history_states = isam2_backend.history()
+                context["two_state_isam2_last_history_frame"] = frame_idx
+        else:
+            result = solve_current_visual_factor()
         if visual_factor_mode == "relative_pose":
             post_solve_visual_norm = _two_state_visual_whitened_norm(
                 result.state_i,
@@ -3749,6 +3980,9 @@ class TwoFrame_PGO(IOptimizer[GraphInput, dict, GraphOutput]):
                     },
                     checkpoint_path / f"sa_v2_prior_after_frame_{frame_idx:06d}.pt",
                 )
+        elif backend_name == "isam2":
+            context["two_state_prior"] = None
+            context["two_state_cross_edge_prior"] = None
         else:
             context["two_state_prior"] = result.prior_j
             context["two_state_cross_edge_prior"] = None
@@ -3758,6 +3992,32 @@ class TwoFrame_PGO(IOptimizer[GraphInput, dict, GraphOutput]):
         pose_WCj_optimized = pp.SE3(result.state_j.pose_WB) @ extrinsic_CI.Inv()
         acc_bias = result.state_j.acc_bias.detach().cpu().float()
         gyro_bias = result.state_j.gyro_bias.detach().cpu().float()
+        if isam2_history_states is not None:
+            (
+                window_frames,
+                window_camera_poses,
+                window_velocity,
+                window_acc_bias,
+                window_gyro_bias,
+            ) = TwoFrame_PGO._isam2_history_tensors(
+                context, isam2_history_states
+            )
+            window_writeback = "all_isam2_history"
+        else:
+            window_frames = torch.tensor([from_idx, frame_idx], dtype=torch.long)
+            window_camera_poses = torch.cat(
+                [pose_WCi_optimized.tensor(), pose_WCj_optimized.tensor()], dim=0
+            ).detach().cpu().float()
+            window_velocity = torch.stack(
+                [result.state_i.velocity_W, result.state_j.velocity_W], dim=0
+            ).detach().cpu().float()
+            window_acc_bias = torch.stack(
+                [result.state_i.acc_bias, result.state_j.acc_bias], dim=0
+            ).detach().cpu().float()
+            window_gyro_bias = torch.stack(
+                [result.state_i.gyro_bias, result.state_j.gyro_bias], dim=0
+            ).detach().cpu().float()
+            window_writeback = "all_two_state"
         output = GraphOutput(
             motion=pose_WCj_optimized.tensor().detach().cpu().float(),
             from_idx=graph_data.from_idx.detach().cpu().clone(),
@@ -3972,23 +4232,15 @@ class TwoFrame_PGO(IOptimizer[GraphInput, dict, GraphOutput]):
                 if isinstance(visual, UVDFactor)
                 else 6
             ),
-            window_frame_indices=torch.tensor([from_idx, frame_idx], dtype=torch.long),
-            window_motions=torch.cat(
-                [pose_WCi_optimized.tensor(), pose_WCj_optimized.tensor()], dim=0
-            ).detach().cpu().float(),
-            window_velocity_world=torch.stack(
-                [result.state_i.velocity_W, result.state_j.velocity_W], dim=0
-            ).detach().cpu().float(),
-            window_acc_bias=torch.stack(
-                [result.state_i.acc_bias, result.state_j.acc_bias], dim=0
-            ).detach().cpu().float(),
-            window_gyro_bias=torch.stack(
-                [result.state_i.gyro_bias, result.state_j.gyro_bias], dim=0
-            ).detach().cpu().float(),
-            local_ba_window_size=2,
-            local_ba_writeback="all_two_state",
-            local_ba_num_frames=2,
-            local_ba_num_edges=1,
+            window_frame_indices=window_frames,
+            window_motions=window_camera_poses,
+            window_velocity_world=window_velocity,
+            window_acc_bias=window_acc_bias,
+            window_gyro_bias=window_gyro_bias,
+            local_ba_window_size=int(window_frames.numel()),
+            local_ba_writeback=window_writeback,
+            local_ba_num_frames=int(window_frames.numel()),
+            local_ba_num_edges=max(int(window_frames.numel()) - 1, 1),
             local_ba_num_visual_residual_blocks=(
                 int(visual.points_Ci.shape[0])
                 if isinstance(visual, UVDFactor)
@@ -4005,6 +4257,31 @@ class TwoFrame_PGO(IOptimizer[GraphInput, dict, GraphOutput]):
             two_state_final_gradient_inf_norm=result.final_gradient_inf_norm,
             two_state_solver_accepted_steps=result.accepted_steps,
             two_state_solver_rejected_steps=result.rejected_steps,
+            vio_backend=backend_name,
+            isam2_update_ms=(
+                float(isam2_update.update_ms) if isam2_update is not None else None
+            ),
+            isam2_state_count=(
+                int(context["two_state_isam2_backend"].state_count)
+                if isam2_update is not None
+                else None
+            ),
+            isam2_history_revision=isam2_history_states is not None,
+            isam2_initial_pose_mismatch_norm=(
+                float(isam2_update.initial_pose_mismatch_norm)
+                if isam2_update is not None
+                else None
+            ),
+            isam2_initial_velocity_mismatch_norm=(
+                float(isam2_update.initial_velocity_mismatch_norm)
+                if isam2_update is not None
+                else None
+            ),
+            isam2_initial_bias_mismatch_norm=(
+                float(isam2_update.initial_bias_mismatch_norm)
+                if isam2_update is not None
+                else None
+            ),
         )
         return context, output
 
@@ -4569,7 +4846,7 @@ class TwoFrame_PGO(IOptimizer[GraphInput, dict, GraphOutput]):
         frame_indices = result.window_frame_indices.reshape(-1).long()
         motions = result.window_motions.reshape(-1, 7).float()
         writeback = str(getattr(result, "local_ba_writeback", "current")).strip().lower()
-        if writeback == "all_two_state":
+        if writeback in {"all_two_state", "all_isam2_history"}:
             update_positions = range(frame_indices.numel())
         elif writeback == "all_optimized":
             update_positions = range(1, frame_indices.numel())  # keep fixed boundary untouched
@@ -4613,8 +4890,8 @@ class TwoFrame_PGO(IOptimizer[GraphInput, dict, GraphOutput]):
                 _write_vec("imu_vio_prev_gyro_bias", next_idx, gyro_bias)
 
         self.last_pair_diagnostics = {
-            "from_idx": int(frame_indices[0].item()),
-            "frame_idx": int(frame_indices[-1].item()),
+            "from_idx": int(result.from_idx.reshape(-1)[0].item()),
+            "frame_idx": int(result.frame_idx.reshape(-1)[0].item()),
             "final_loss": result.final_loss,
             "visual_loss": result.visual_loss,
             "imu_rot_loss": result.imu_rot_loss,
@@ -4690,6 +4967,19 @@ class TwoFrame_PGO(IOptimizer[GraphInput, dict, GraphOutput]):
             "two_state_final_gradient_inf_norm": result.two_state_final_gradient_inf_norm,
             "two_state_solver_accepted_steps": result.two_state_solver_accepted_steps,
             "two_state_solver_rejected_steps": result.two_state_solver_rejected_steps,
+            "vio_backend": result.vio_backend,
+            "isam2_update_ms": result.isam2_update_ms,
+            "isam2_state_count": result.isam2_state_count,
+            "isam2_history_revision": result.isam2_history_revision,
+            "isam2_initial_pose_mismatch_norm": (
+                result.isam2_initial_pose_mismatch_norm
+            ),
+            "isam2_initial_velocity_mismatch_norm": (
+                result.isam2_initial_velocity_mismatch_norm
+            ),
+            "isam2_initial_bias_mismatch_norm": (
+                result.isam2_initial_bias_mismatch_norm
+            ),
         }
         for field_name in (
             "imu_vio_sa_v2_prior_reset",
