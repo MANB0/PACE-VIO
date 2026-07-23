@@ -4,7 +4,7 @@ import numpy as np
 import pypose as pp
 import torch
 
-from Utility.PoseFrame import convert_pose_frame
+from Utility.PoseFrame import convert_pose_frame, convert_pose_world_frame_only
 
 
 def compose_camera_to_imu_poses(
@@ -13,8 +13,9 @@ def compose_camera_to_imu_poses(
 ) -> np.ndarray:
     """Compose ``T_WI = T_WC * T_CI`` for one transform per pose or one constant.
 
-    Both inputs must use the same coordinate convention. The project runtime
-    stores these values in its internal NED convention.
+    ``T_WC`` uses MACVO's internal world/camera NED axes. ``T_CI`` maps the
+    raw IMU frame I into that camera frame C, so their adjacent C frames are
+    compatible even when I itself is FLU.
     """
     poses = np.asarray(camera_poses, dtype=np.float64)
     extrinsic = np.asarray(camera_T_imu, dtype=np.float64)
@@ -122,7 +123,7 @@ def camera_nwu_poses_to_imu_nwu(
     """Move NWU camera-origin poses to the IMU origin using the runtime T_CI."""
     camera_ned = convert_pose_frame(camera_poses_nwu, "NWU", "NED")
     imu_ned = compose_camera_to_imu_poses(camera_ned, camera_T_imu_internal_ned)
-    return convert_pose_frame(imu_ned, "NED", "NWU")
+    return convert_pose_world_frame_only(imu_ned, "NED", "NWU")
 
 
 def camera_velocity_to_imu_velocity_nwu(

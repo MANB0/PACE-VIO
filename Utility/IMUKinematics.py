@@ -48,59 +48,6 @@ def gravity_is_standard_local_frame(mode: str | None) -> bool:
     return normalize_gravity_handling(mode) == STANDARD_LOCAL_FRAME_PREINTEGRATION
 
 
-def transform_imu_samples_to_internal_frame(
-    acc: torch.Tensor,
-    gyro: torch.Tensor,
-    imu_T_BS: pp.LieTensor | torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Rotate IMU samples from sensor measurement frame into MACVO's body frame.
-
-    ``imu_T_BS`` follows the project-wide body-to-sensor convention, so sensor
-    measurements are mapped back to body/internal coordinates with the inverse
-    rotation.
-    """
-    acc_samples = acc.reshape(-1, 3)
-    gyro_samples = gyro.reshape(-1, 3)
-    transform = pp.SE3(
-        torch.as_tensor(
-            imu_T_BS.tensor() if isinstance(imu_T_BS, pp.LieTensor) else imu_T_BS,
-            device=acc_samples.device,
-            dtype=torch.float64,
-        ).reshape(7)
-    )
-    body_to_sensor_rotation = transform.rotation().matrix().reshape(3, 3)
-    identity = torch.eye(3, device=body_to_sensor_rotation.device, dtype=body_to_sensor_rotation.dtype)
-    if torch.allclose(body_to_sensor_rotation, identity, atol=1e-6):
-        return acc_samples.clone(), gyro_samples.clone()
-
-    sensor_to_body_rotation = body_to_sensor_rotation.transpose(0, 1)
-    acc_rotation = sensor_to_body_rotation.to(device=acc_samples.device, dtype=acc_samples.dtype)
-    gyro_rotation = sensor_to_body_rotation.to(device=gyro_samples.device, dtype=gyro_samples.dtype)
-    acc_internal = (acc_rotation @ acc_samples.unsqueeze(-1)).squeeze(-1)
-    gyro_internal = (gyro_rotation @ gyro_samples.unsqueeze(-1)).squeeze(-1)
-    return acc_internal, gyro_internal
-
-
-def _normalized_imu_sigma_unit(sigma_unit: str | None) -> str:
-    unit = "legacy_sqrt_rate_scaled" if sigma_unit is None else str(sigma_unit).strip().lower()
-    return unit.replace("_", " ").replace("-", " ")
-
-
-def _convert_imu_sigma_value(
-    sigma_value: float | list[float] | tuple[float, ...] | torch.Tensor,
-    scale: float,
-) -> float | tuple[float, float, float]:
-    values = torch.as_tensor(sigma_value, dtype=torch.float64).reshape(-1)
-    if values.numel() not in {1, 3}:
-        raise ValueError(
-            f"IMU sigma must contain one isotropic value or three axis values, got {values.numel()}"
-        )
-    converted = values * float(scale)
-    if converted.numel() == 1:
-        return float(converted.item())
-    return tuple(float(value) for value in converted.tolist())
-
-
 def imu_sigma_rms(
     sigma_value: float | list[float] | tuple[float, ...] | torch.Tensor,
 ) -> float:
@@ -136,59 +83,6 @@ def format_imu_sigma(
     if values.numel() == 1:
         return f"{float(values.item()):.7g}"
     return "[" + ", ".join(f"{float(value):.7g}" for value in values.tolist()) + "]"
-
-
-def imu_sigma_to_continuous_density(
-    sigma_value: float | list[float] | tuple[float, ...] | torch.Tensor,
-    rate_hz: float,
-    sigma_unit: str | None = None,
-) -> float | tuple[float, float, float]:
-    """Convert IMU metadata sigma values to continuous noise density.
-
-    Existing datasets without an explicit unit keep the historical sqrt(rate)
-    scaling. HoloOcean metadata marks its values as per-sample standard
-    deviations, which need the inverse conversion.
-    """
-    rate = max(float(rate_hz), 1e-9)
-    unit = _normalized_imu_sigma_unit(sigma_unit)
-
-    if "per" in unit and "sample" in unit:
-        return _convert_imu_sigma_value(sigma_value, 1.0 / (rate ** 0.5))
-    if "continuous" in unit or "noise density" in unit:
-        return _convert_imu_sigma_value(sigma_value, 1.0)
-    if "legacy" in unit and "sqrt" in unit:
-        return _convert_imu_sigma_value(sigma_value, rate ** 0.5)
-    raise ValueError(
-        f"Unsupported IMU sigma_unit={sigma_unit!r}; expected per-sample, "
-        "continuous noise density, or legacy sqrt-rate scaling"
-    )
-
-
-def imu_bias_sigma_to_continuous_random_walk_density(
-    sigma_value: float | list[float] | tuple[float, ...] | torch.Tensor,
-    rate_hz: float,
-    sigma_unit: str | None = None,
-) -> float | tuple[float, float, float]:
-    """Convert bias random-walk metadata sigma to continuous density.
-
-    HoloOcean applies ``AccelBiasSigma`` and ``AngVelBiasSigma`` as a per-tick
-    random-walk increment on the hidden sensor bias. If the metadata reports
-    that per-sample increment standard deviation, the equivalent continuous
-    random-walk density is ``sigma_step / sqrt(dt)``.
-    """
-    rate = max(float(rate_hz), 1e-9)
-    unit = _normalized_imu_sigma_unit(sigma_unit)
-
-    if "per" in unit and ("sample" in unit or "tick" in unit):
-        return _convert_imu_sigma_value(sigma_value, rate ** 0.5)
-    if "continuous" in unit or "noise density" in unit or "random walk density" in unit:
-        return _convert_imu_sigma_value(sigma_value, 1.0)
-    if "legacy" in unit and "sqrt" in unit:
-        return _convert_imu_sigma_value(sigma_value, rate ** 0.5)
-    raise ValueError(
-        f"Unsupported IMU bias sigma_unit={sigma_unit!r}; expected per-sample bias "
-        "increment, continuous random-walk density, or legacy sqrt-rate scaling"
-    )
 
 
 def gravity_for_world_frame(gravity: float, world_frame: str | None) -> float:

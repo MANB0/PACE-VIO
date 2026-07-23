@@ -7,8 +7,6 @@ args:
   format: png
   pose_output_frame: NWU
   gravity: 9.81
-  auto_estimate_time_offset: true
-  imu_time_offset_ns: 0
   imu_window_ns: 100000000
   imu_fallback_max_dt_ns: -1
   bl: 0.225

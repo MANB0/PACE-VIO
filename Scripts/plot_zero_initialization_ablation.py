@@ -154,10 +154,10 @@ def main() -> int:
     static_path = args.zero_root / "static_initialization.json"
 
     metadata = json.loads((args.dataset / "metadata.json").read_text(encoding="utf-8"))
-    body_to_imu = np.asarray(
-        metadata["extrinsics"]["T_body_imu"]["translation_body_nwu_m"],
-        dtype=np.float64,
-    )
+    matrix_CI = np.asarray(metadata["extrinsics"]["T_CI"], dtype=np.float64)
+    if matrix_CI.shape != (4, 4):
+        raise ValueError("metadata.extrinsics.T_CI must be 4x4")
+    body_to_imu = np.diag([1.0, -1.0, -1.0]) @ matrix_CI[:3, 3]
     gt_time, gt_body = load_poses(args.dataset / "ref_pose.csv")
     baseline_time, baseline = load_poses(args.baseline)
     zero_time, zero = load_poses(zero_pose_path)

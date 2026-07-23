@@ -1,7 +1,7 @@
 # Validated real-time T2 snapshot and rollback point
 
 This private repository is a code-only release of the MACVO + IMU real-time
-T2 pipeline frozen on 2026-07-21.
+T2-iSAM2 pipeline validated on 2026-07-23.
 
 ## Included validated behavior
 
@@ -9,11 +9,17 @@ T2 pipeline frozen on 2026-07-21.
   matching visual output and IMU interval.
 - The online T2 backend uses the compressed UVD visual factor and the standard
   local-frame IMU preintegration path.
+- The optional iSAM2 backend consumes the same compressed UVD, local-frame IMU,
+  and bias random-walk factor packets without first running the two-state
+  optimizer.
 - The dashboard publishes independent `MACVO raw`, `VIO committed`, and GT
   trajectories at the agreed IMU-center coordinate contract.
 - The dashboard includes stereo images, continuously retained IMU samples,
   pan/zoom/reset controls, pipeline status lights, and a draggable replay
   timeline that works while new frames continue to arrive.
+- Dataset metadata uses continuous-time IMU noise densities and one 4x4
+  `T_CI`, with `p_C = T_CI p_I`. Raw IMU FLU samples remain in their native
+  frame during initialization and preintegration.
 
 The minimal branch entry points are:
 
@@ -22,11 +28,13 @@ The minimal branch entry points are:
 - `Scripts/download_models.py`
 - `Utility/LiveDashboard.py`
 - `Utility/TwoStateVIO.py`
+- `Utility/T2ISAM2Backend.py`
+- `Utility/T2FactorPacket.py`
 - `Utility/CompressedUVDFactorCache.py`
 
-The regression contract is in:
-
-- `Scripts/UnitTest/test_live_t2_raw_contract.py`
+The regression contracts are in `Scripts/UnitTest`, including live frontend
+ordering, static initialization modes, the single-`T_CI` frame contract,
+factor-packet consistency, and the iSAM2 backend.
 
 ## Freeze provenance
 
@@ -46,10 +54,20 @@ Validated model SHA-256:
 ## Verification
 
 ```bash
-pytest -q
+python -m pytest -q Scripts/UnitTest
 ```
 
-The frozen environment reports `5 passed`.
+The validated environment reports `32 passed`. A 100-frame smoke replay using
+the real MACVO frontend, fixed three-second IMU initialization, and the iSAM2
+backend completed successfully on 2026-07-23. Its runtime contract reported:
+
+- `live MACVO stereo frontend (no visual cache)`
+- `isam2 + compressed_uvd T2 factor packets`
+- `standard_local_frame_preintegration`
+- `IMU center for VIO output`
+
+Model weights remain intentionally excluded from Git. The bootstrap/download
+scripts fetch and verify the required model before runtime.
 
 The full pre-trim source remains on `main` and the immutable rollback tag
 `realtime-t2-full-20260721`. This branch does not include datasets, generated

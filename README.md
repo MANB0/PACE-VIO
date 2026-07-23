@@ -28,7 +28,8 @@ CPU 负责 T2 求解，GPU 负责 MACVO 神经网络前端。没有 CUDA GPU 时
 ## 1. Clone 与环境
 
 ```bash
-git clone --depth 1 https://github.com/MANB0/macvo-realtime-t2-vio.git
+git clone --depth 1 --branch codex/realtime-minimal \
+  https://github.com/MANB0/macvo-realtime-t2-vio.git
 cd macvo-realtime-t2-vio
 bash Scripts/bootstrap_conda.sh macvo-t2
 conda activate macvo-t2
@@ -55,6 +56,13 @@ my_sequence/
 ```
 
 `ref_pose.csv` 仅用于 GT 展示与评估，不是估计器输入。完整字段和坐标契约见 [docs/DATASET_FORMAT.md](docs/DATASET_FORMAT.md)。
+
+相机和 IMU 之间只读取 `metadata.extrinsics.T_CI` 这一份 4x4 外参，定义为
+`p_C = T_CI p_I`。原始 IMU 测量在 FLU 坐标中完成初始化和预积分，不再经过
+隐藏的 FLU/NED 预旋转；相机位姿与 IMU 状态仅通过
+`T_WI = T_WC T_CI` 和 `T_WC = T_WI T_CI^{-1}` 相互转换。
+图片文件名与 IMU CSV 时间戳固定使用纳秒，相机/IMU 时间偏移固定为 0；程序不从
+metadata 读取时间字段，也不根据数据端点自动估计偏移。
 
 ## 3. 直接运行
 
@@ -151,7 +159,7 @@ python Scripts/run_realtime_t2.py \
 - `MACVO raw` 保留纯视觉历史；网页对比时根据 metadata 外参转换到约定参考点。
 - IMU 预积分只使用 body-frame 原始测量、dt、bias 线性化点和噪声参数；重力仅进入因子残差。
 - 默认 T2 为 `two_state_fixed_lag + compressed_uvd`，不是 T0 相对位姿因子。
-- 四个 IMU sigma 和相机/IMU 外参优先从 `metadata.json` 读取，不用配置文件中的兜底值覆盖有效 metadata。
+- 四个连续时间 IMU 噪声密度和相机/IMU 外参从 `metadata.json` 读取；离散化使用 CSV 纳秒时间戳，不依赖名义采样频率。
 
 ## 历史回退
 

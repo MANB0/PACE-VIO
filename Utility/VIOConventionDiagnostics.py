@@ -8,19 +8,14 @@ FULL_VIO_CONVENTION_EXPECTED = {
     "imu_source_world_frame": "NWU",
     "imu_source_measurement_frame": "FLU",
     "imu_internal_world_frame": "NED",
-    "imu_internal_measurement_frame": "NED",
-    "imu_acc_unit": "m/s^2",
-    "imu_gyro_unit": "rad/s",
-    "imu_timestamp_unit": "ns",
+    "imu_internal_measurement_frame": "FLU",
 }
 FULL_VIO_NUMERIC_CONVENTION_FIELDS = (
-    "imu_time_offset_ns",
     "imu_metadata_gravity_m_s2",
     "imu_preintegration_gravity_z",
 )
 FULL_VIO_CONVENTION_FIELDS = set(FULL_VIO_CONVENTION_EXPECTED) | set(FULL_VIO_NUMERIC_CONVENTION_FIELDS) | {
     "imu_gravity_source",
-    "imu_time_offset_source",
 }
 ACTIVE_FULL_VIO_FACTOR_MODES = {
     "preintegrated_vio",
@@ -75,18 +70,12 @@ def validate_full_vio_convention(row: dict[str, str]) -> tuple[bool, str]:
             return False, f"{key}={actual!r}, expected {expected!r}"
     if not str(row.get("imu_gravity_source", "")).strip():
         return False, "imu_gravity_source is empty"
-    time_offset_source = str(row.get("imu_time_offset_source", "")).strip()
-    if not time_offset_source.startswith("metadata.time_synchronization."):
-        return False, f"imu_time_offset_source={time_offset_source!r}, expected metadata time synchronization"
     numeric_values: dict[str, float] = {}
     for key in FULL_VIO_NUMERIC_CONVENTION_FIELDS:
         try:
             numeric_values[key] = float(str(row.get(key, "")).strip())
         except ValueError:
             return False, f"{key} is not numeric"
-    time_offset_ns = numeric_values["imu_time_offset_ns"]
-    if abs(time_offset_ns) > 1e-9:
-        return False, f"imu_time_offset_ns={time_offset_ns!r}, expected metadata-declared zero offset"
     metadata_gravity = numeric_values["imu_metadata_gravity_m_s2"]
     preintegration_gravity_z = numeric_values["imu_preintegration_gravity_z"]
     if metadata_gravity <= 0.0:

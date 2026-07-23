@@ -17,7 +17,12 @@ class IMUSamplingMap:
 
 
 class IMUCSVLoader:
-    """Load IMU CSV rows and provide exact interval endpoint interpolation."""
+    """Load SI-unit IMU rows and provide exact interval endpoint interpolation.
+
+    Input acceleration is m/s^2 and angular velocity is rad/s. Acceleration
+    follows the project FLU convention and reads approximately [0, 0, +g]
+    while stationary. No unit or gravity conversion is performed here.
+    """
 
     def __init__(self, csv_path: Path) -> None:
         assert csv_path.exists(), f"IMU csv file does not exist: {csv_path}"

@@ -30,7 +30,7 @@ try:
 except Exception:  # pragma: no cover - dashboard image support is optional
     Image = None
 
-from Utility.PoseFrame import convert_pose_frame
+from Utility.PoseFrame import convert_pose_world_frame_only
 from Utility.TrajectoryReference import compose_camera_to_imu_poses
 
 
@@ -400,11 +400,16 @@ class LiveDashboard:
             body_to_imu = np.zeros(3, dtype=np.float64)
             if metadata_path.exists():
                 meta = json.loads(metadata_path.read_text(encoding="utf-8"))
-                body_to_imu = np.asarray(
-                    meta.get("extrinsics", {}).get("T_body_imu", {}).get(
-                        "translation_body_nwu_m", [0.0, 0.0, 0.0]
-                    ), dtype=np.float64,
+                matrix_CI = np.asarray(
+                    meta.get("extrinsics", {}).get("T_CI"),
+                    dtype=np.float64,
                 )
+                if matrix_CI.shape != (4, 4):
+                    raise ValueError("metadata.extrinsics.T_CI must be 4x4")
+                # ref_pose orientation uses body FLU/NWU axes. T_CI translation
+                # is expressed in MACVO camera FRD/NED axes, hence D*t_CI.
+                ned_to_nwu = np.diag([1.0, -1.0, -1.0])
+                body_to_imu = ned_to_nwu @ matrix_CI[:3, 3]
             rows = []
             with path.open("r", newline="", encoding="utf-8") as stream:
                 for row in csv.DictReader(stream):
@@ -437,7 +442,7 @@ class LiveDashboard:
         pose = frames["pose"][index].detach().cpu().double().reshape(1, 7).numpy()
         ext = frames["imu_vio_sensor_T_imu"][index].detach().cpu().double().reshape(1, 7).numpy()
         imu_internal = compose_camera_to_imu_poses(pose, ext)
-        imu_nwu = convert_pose_frame(imu_internal, "NED", "NWU")[0]
+        imu_nwu = convert_pose_world_frame_only(imu_internal, "NED", "NWU")[0]
         if self._gt_anchor is None:
             self._gt_anchor = imu_nwu[:3].copy()
         position = (imu_nwu[:3] - self._gt_anchor).tolist()
@@ -453,7 +458,7 @@ class LiveDashboard:
             pose = raw_pose.detach().cpu().double().reshape(1, 7).numpy()
             ext = system.graph.frames.data["imu_vio_sensor_T_imu"][index].detach().cpu().double().reshape(1, 7).numpy()
             imu_internal = compose_camera_to_imu_poses(pose, ext)
-            imu_nwu = convert_pose_frame(imu_internal, "NED", "NWU")[0]
+            imu_nwu = convert_pose_world_frame_only(imu_internal, "NED", "NWU")[0]
             if self._gt_anchor is None:
                 self._gt_anchor = imu_nwu[:3].copy()
             return (imu_nwu[:3] - self._gt_anchor).tolist(), imu_nwu[3:].tolist()

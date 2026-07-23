@@ -195,7 +195,8 @@ def parse_args() -> argparse.Namespace:
         default="estimated",
         help=(
             "estimated applies the detected attitude and biases; zero keeps the same "
-            "static boundary but starts VIO from identity attitude and zero biases"
+            "static boundary and camera/IMU frame alignment, but discards the detected "
+            "roll/pitch and starts with zero biases"
         ),
     )
     parser.add_argument("--static-init-min-duration-s", type=float, default=1.0)
@@ -289,6 +290,18 @@ def main() -> int:
         "backend": f"{args.vio_backend} + compressed_uvd T2 factor packets",
         "preintegration": "standard_local_frame_preintegration",
         "trajectory_reference": "IMU center for VIO output",
+        "frame_contract": {
+            "world_internal": "NED",
+            "world_export": "NWU",
+            "imu_measurement_and_preintegration_frame": "raw FLU",
+            "camera_internal_frame": "FRD/NED",
+        },
+        "extrinsic_contract": {
+            "field": "metadata.extrinsics.T_CI",
+            "equation": "p_C = T_CI p_I",
+            "state_composition": "T_WI = T_WC * T_CI",
+            "raw_imu_samples_transformed": False,
+        },
         "static_initialization": {
             "mode": args.static_init_mode,
             "state_policy": args.static_init_state_policy,

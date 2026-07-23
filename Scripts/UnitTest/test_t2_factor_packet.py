@@ -25,7 +25,12 @@ def _state(translation, velocity) -> NavigationState:
 
 
 def _packet() -> T2FactorPacket:
-    identity = pp.identity_SE3(1, dtype=torch.float64).tensor()
+    extrinsic = pp.from_matrix(torch.tensor([[
+        [1.0, 0.0, 0.0, -0.417],
+        [0.0, -1.0, 0.0, 0.180],
+        [0.0, 0.0, -1.0, 0.095],
+        [0.0, 0.0, 0.0, 1.0],
+    ]], dtype=torch.float64), pp.SE3_type).tensor()
     imu = ImuPreintegrationFactor(
         delta_rotation=torch.tensor([0.01, -0.02, 0.03], dtype=torch.float64),
         delta_velocity=torch.tensor([0.1, -0.2, 0.3], dtype=torch.float64),
@@ -47,7 +52,7 @@ def _packet() -> T2FactorPacket:
         ).Exp().tensor(),
         sqrt_information=torch.eye(6, dtype=torch.float64) * 4.0,
         residual_offset=torch.linspace(-0.2, 0.3, 6, dtype=torch.float64),
-        extrinsic_CI=identity,
+        extrinsic_CI=extrinsic,
         marginal_mode="full",
     )
     return T2FactorPacket.create(
@@ -57,7 +62,7 @@ def _packet() -> T2FactorPacket:
         state_j_initial=_state([0.01, 0.0, 0.0], [0.1, 0.01, 0.0]),
         imu=imu,
         visual=visual,
-        extrinsic_CI=identity,
+        extrinsic_CI=extrinsic,
     )
 
 

@@ -93,7 +93,8 @@ class T2FactorPacket:
       * state tangent: ``[p, phi, v, ba, bg]``;
       * IMU residual/covariance: ``[p, v, R]`` in the frame-i body tangent;
       * visual relative pose: ``T_CjCi`` with right tangent ``[t, phi]``;
-      * extrinsic: ``T_CI`` (IMU/body to left camera).
+      * extrinsic: ``T_CI`` mapping raw IMU frame I to MACVO camera frame C,
+        with ``p_C = T_CI p_I``.
 
     The packet is materialized as detached CPU float64 data. Both the existing
     two-state solver and the incremental iSAM2 backend must consume this exact

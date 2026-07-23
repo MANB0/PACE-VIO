@@ -10,8 +10,16 @@ from types import SimpleNamespace
 from Utility.Extensions import ConfigTestableSubclass,TensorQueue
 from Utility.PrettyPrint import Logger
 from DataLoader import StereoFrame, StereoInertialFrame, T_Data
-from Utility.IMUKinematics import transform_imu_samples_to_internal_frame
 from Utility.Timer import Timer
+
+
+def _camera_delta_from_raw_imu_delta(frame: StereoInertialFrame, delta_I: pp.LieTensor) -> pp.LieTensor:
+    """Convert an IMU-frame relative motion to the MACVO camera frame."""
+    extrinsic = getattr(frame, "imu_vio_sensor_T_imu", None)
+    if extrinsic is None:
+        return delta_I
+    extrinsic_CI = pp.SE3(extrinsic).to(device=delta_I.device, dtype=delta_I.dtype)
+    return extrinsic_CI @ delta_I @ extrinsic_CI.Inv()
 
 
 class IMotionModel(ABC, Generic[T_Data], ConfigTestableSubclass):
@@ -191,7 +199,6 @@ class IMUGyroMotionModel(IMotionModel[StereoInertialFrame]):
             return None
 
         gyro = imu.gyro.reshape(-1, 3).to(device=self.device, dtype=torch.float32) - self.gyro_bias
-        _, gyro = transform_imu_samples_to_internal_frame(torch.zeros_like(gyro), gyro, imu.T_BS)
         imu_time_ns = imu.time_ns.reshape(-1).to(device=self.device, dtype=torch.float64)
 
         if gyro.size(0) == 1:
@@ -206,7 +213,8 @@ class IMUGyroMotionModel(IMotionModel[StereoInertialFrame]):
             omega_int = omega_int * (self.max_delta_angle_rad / angle)
 
         delta_twist = torch.cat([torch.zeros(3, device=self.device), omega_int], dim=0)
-        return pp.se3(delta_twist).Exp()
+        delta_I = pp.se3(delta_twist).Exp()
+        return _camera_delta_from_raw_imu_delta(frame, delta_I)
 
     def update(self, pose: pp.LieTensor) -> None:
         self.prev_pose = pose.to(self.device)
@@ -342,12 +350,12 @@ class IMUConstVelMotionModel(IMotionModel[StereoInertialFrame]):
         self.max_delta_angle_rad = float(getattr(config, "max_delta_angle_rad", 0.8))
         self.fallback_dt_s = float(getattr(config, "fallback_dt_s", 0.01))
 
-    def _integrate_gyro(self, imu) -> torch.Tensor | None:
-        """Integrate gyro to get rotation vector delta. Returns None if no IMU data."""
+    def _integrate_gyro(self, frame: StereoInertialFrame) -> pp.LieTensor | None:
+        """Integrate raw gyro and express the relative motion in the camera frame."""
+        imu = frame.imu
         if imu.gyro.numel() == 0 or imu.time_ns.numel() == 0:
             return None
         gyro = imu.gyro.reshape(-1, 3).to(device=self.device, dtype=torch.float32) - self.gyro_bias
-        _, gyro = transform_imu_samples_to_internal_frame(torch.zeros_like(gyro), gyro, imu.T_BS)
         imu_time_ns = imu.time_ns.reshape(-1).to(device=self.device, dtype=torch.float64)
 
         if gyro.size(0) == 1:
@@ -360,7 +368,8 @@ class IMUConstVelMotionModel(IMotionModel[StereoInertialFrame]):
         angle = torch.linalg.norm(omega_int)
         if angle > self.max_delta_angle_rad:
             omega_int = omega_int * (self.max_delta_angle_rad / angle)
-        return omega_int
+        delta_I = pp.se3(torch.cat([torch.zeros(3, device=self.device), omega_int], dim=0)).Exp()
+        return _camera_delta_from_raw_imu_delta(frame, delta_I)
 
     @Timer.cpu_timeit("MotionModel")
     @Timer.gpu_timeit("MotionModel")
@@ -371,16 +380,13 @@ class IMUConstVelMotionModel(IMotionModel[StereoInertialFrame]):
             return self.prev_pose
 
         # Default: repeat last pose (StaticMotionModel fallback)
-        omega_int = None
+        imu_delta_camera = None
         if isinstance(frame, StereoInertialFrame):
-            omega_int = self._integrate_gyro(frame.imu)
+            imu_delta_camera = self._integrate_gyro(frame)
 
-        if omega_int is None:
+        if imu_delta_camera is None:
             # No IMU data → pure static
             return self.prev_pose
-
-        # Rotation from IMU gyro
-        delta_twist_rot = omega_int.to(device=self.device)
 
         # Translation from constant velocity model
         if self.prev_velocity is not None and self.prev_velocity.norm().item() > 1e-6:
@@ -390,8 +396,11 @@ class IMUConstVelMotionModel(IMotionModel[StereoInertialFrame]):
         else:
             delta_twist_trans = torch.zeros(3, device=self.device)
 
-        delta_twist = torch.cat([delta_twist_trans, delta_twist_rot], dim=0)
-        delta_pose = pp.se3(delta_twist).Exp()
+        delta_translation = pp.se3(torch.cat([
+            delta_twist_trans,
+            torch.zeros(3, device=self.device),
+        ], dim=0)).Exp()
+        delta_pose = delta_translation @ imu_delta_camera
 
         predict = self.prev_pose @ delta_pose
         self.prev_pose = predict

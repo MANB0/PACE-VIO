@@ -18,15 +18,12 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from Utility.PoseFrame import convert_pose_frame
+from Utility.PoseFrame import convert_pose_world_frame_only
 from Utility.T2HistorySmoother import (
     factor_cost_breakdown,
     load_t2_history_archive,
 )
 from Utility.TwoStateVIO import NavigationState
-
-
-FLU_TO_NED = np.diag([1.0, -1.0, -1.0])
 
 
 def parse_args() -> argparse.Namespace:
@@ -166,7 +163,7 @@ def navigation_states(frame: pd.DataFrame) -> tuple[NavigationState, ...]:
     pose_nwu = frame[
         ["tx_nwu", "ty_nwu", "tz_nwu", "qx_nwu", "qy_nwu", "qz_nwu", "qw_nwu"]
     ].to_numpy(np.float64)
-    pose_internal = convert_pose_frame(pose_nwu, "NWU", "NED")
+    pose_internal = convert_pose_world_frame_only(pose_nwu, "NWU", "NED")
     velocity_nwu = frame[["vx_nwu", "vy_nwu", "vz_nwu"]].to_numpy(np.float64)
     velocity_internal = velocity_nwu.copy()
     velocity_internal[:, 1:3] *= -1.0
@@ -295,13 +292,13 @@ def main() -> None:
         timestamps,
         "timestamp",
         ["acc_bias_x", "acc_bias_y", "acc_bias_z"],
-    ) @ FLU_TO_NED.T
+    )
     gyro_bias_truth = interpolate_rows(
         args.bias_truth,
         timestamps,
         "timestamp",
         ["gyro_bias_x", "gyro_bias_y", "gyro_bias_z"],
-    ) @ FLU_TO_NED.T
+    )
     metrics = [
         evaluate_method(
             "online_t2", online, truth, velocity_truth, acc_bias_truth, gyro_bias_truth

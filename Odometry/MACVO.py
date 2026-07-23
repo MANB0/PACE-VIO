@@ -44,7 +44,6 @@ from Utility.IMUKinematics import (
     select_rotation_prior_std,
     select_translation_active_rotation_prior_std,
     should_enable_preintegrated_vio_factor,
-    transform_imu_samples_to_internal_frame,
     translation_prior_semantics,
 )
 from Utility.PrettyPrint import Logger, GlobalConsole
@@ -53,7 +52,7 @@ from Utility.VIOConventionDiagnostics import (
     camera_velocity_to_imu_origin,
     world_nwu_vector_to_internal,
 )
-from Utility.PoseFrame import write_timed_se3_csv, convert_pose_frame
+from Utility.PoseFrame import write_timed_se3_csv, convert_pose_world_frame_only
 from Utility.TrajectoryReference import compose_camera_to_imu_poses
 from Utility.Timer import Timer
 from Utility.Visualize import fig_plt
@@ -909,7 +908,7 @@ class MACVO(IOdometry[T_SensorFrame], ConfigTestable):
         ext_np = ext.detach().cpu().double().numpy()
         raw_imu_internal = compose_camera_to_imu_poses(poses_camera_np, ext_np)
         output_frame = str(getattr(sequence, "pose_output_frame", "NED")).upper()
-        raw_imu_output = convert_pose_frame(raw_imu_internal, "NED", output_frame)
+        raw_imu_output = convert_pose_world_frame_only(raw_imu_internal, "NED", output_frame)
         write_timed_se3_csv(
             saveto.path("macvo_raw_poses_imu.csv"),
             time_ns,
@@ -1914,7 +1913,7 @@ class MACVO(IOdometry[T_SensorFrame], ConfigTestable):
     @staticmethod
     def _imu_sample_sigma(
         density,
-        rate_hz: float,
+        time_ns: torch.Tensor,
         *,
         floor: float,
         multiplier: float,
@@ -1924,7 +1923,13 @@ class MACVO(IOdometry[T_SensorFrame], ConfigTestable):
             values = values.repeat(3)
         if values.numel() != 3:
             raise ValueError("IMU calibration sigma must be scalar or three-axis")
-        sample_sigma = values * max(float(rate_hz), 1e-9) ** 0.5
+        stamps = torch.as_tensor(time_ns, dtype=torch.long).reshape(-1)
+        intervals_s = (stamps[1:] - stamps[:-1]).to(torch.float64) * 1e-9
+        intervals_s = intervals_s[intervals_s > 0.0]
+        if intervals_s.numel() > 0:
+            sample_sigma = values / torch.sqrt(torch.median(intervals_s))
+        else:
+            sample_sigma = values
         return torch.maximum(
             sample_sigma * float(multiplier),
             torch.full_like(sample_sigma, float(floor)),
@@ -1969,31 +1974,36 @@ class MACVO(IOdometry[T_SensorFrame], ConfigTestable):
             self._imu_static_last_time_ns = int(stamps[-1].item())
 
         if self._imu_static_initial_rotation is None:
+            extrinsic_CI = self._frame_imu_vio_sensor_T_imu(frame)
             if self.prev_keyframe is not None:
-                pose = pp.SE3(self.graph.frames.data["pose"][self.prev_keyframe[1]])
-                self._imu_static_anchor_pose = pp.SE3(pose.tensor().detach().clone()).float()
-                self._imu_static_initial_rotation = pose.rotation().detach().cpu().float()
+                pose_WC = pp.SE3(self.graph.frames.data["pose"][self.prev_keyframe[1]])
+                pose_WI = pose_WC @ extrinsic_CI.to(device=pose_WC.device, dtype=pose_WC.dtype)
+                self._imu_static_anchor_pose = pp.SE3(pose_WC.tensor().detach().clone()).float()
+                self._imu_static_initial_rotation = pp.SO3(
+                    pose_WI.rotation().tensor().detach().cpu().float().reshape(4)
+                )
             else:
                 self._imu_static_anchor_pose = pp.identity_SE3(dtype=torch.float32)
-                self._imu_static_initial_rotation = pp.identity_SO3(dtype=torch.float32)
+                self._imu_static_initial_rotation = pp.SO3(
+                    extrinsic_CI.rotation().tensor().detach().cpu().float().reshape(4)
+                )
 
         if not self._imu_static_time_chunks:
             return True
         all_time = torch.cat(self._imu_static_time_chunks, dim=0)
         all_acc = torch.cat(self._imu_static_acc_chunks, dim=0)
         all_gyro = torch.cat(self._imu_static_gyro_chunks, dim=0)
-        measurement_rate_hz = float(getattr(frame, "imu_calib_measurement_rate_hz", 100.0))
         acc_density = getattr(frame, "imu_calib_acc_sigma", self.imu_sigma_acc)
         gyro_density = getattr(frame, "imu_calib_gyro_sigma", self.imu_sigma_gyro)
         acc_std_limit = self._imu_sample_sigma(
             acc_density,
-            measurement_rate_hz,
+            all_time,
             floor=0.05,
             multiplier=self.imu_static_sigma_multiplier,
         )
         gyro_std_limit = self._imu_sample_sigma(
             gyro_density,
-            measurement_rate_hz,
+            all_time,
             floor=0.005,
             multiplier=self.imu_static_sigma_multiplier,
         )
@@ -2104,7 +2114,7 @@ class MACVO(IOdometry[T_SensorFrame], ConfigTestable):
         applied_attitude = (
             result.body_to_world.clone().float()
             if estimate_applied
-            else pp.identity_SO3(dtype=torch.float32)
+            else self._imu_static_initial_rotation.clone().float()
         )
         self._imu_static_init_diag = {
             "mode": self.imu_static_initialization_mode,
@@ -2166,8 +2176,8 @@ class MACVO(IOdometry[T_SensorFrame], ConfigTestable):
         Uses full 15-state IMU preintegration (Forster et al. TRO 2017) with:
           - Proper continuous-time noise density → sampled-noise covariance conversion
           - Velocity state propagation across keyframes
-          - Gravity compensation via current world-frame orientation
-          - Sensor/source frame conversion into MACVO's internal visual-optimization frame
+          - Gravity applied only in the factor residual
+          - Raw IMU measurement-frame deltas, without camera/world pre-rotation
 
         rot_prior_vec: (1,3) preintegrated rotation vector in body_i frame
         rot_prior_std: (1,)  scalar std (diag mean of rot covariance)
@@ -2193,9 +2203,6 @@ class MACVO(IOdometry[T_SensorFrame], ConfigTestable):
         time_ns = imu.time_ns.reshape(-1).long()
         acc_raw = imu.acc.reshape(-1, 3).float()
         gyro_raw = imu.gyro.reshape(-1, 3).float()
-
-        # ── Sensor → MACVO internal: use inverse body-to-sensor rotation before preintegration
-        acc_raw, gyro_raw = transform_imu_samples_to_internal_frame(acc_raw, gyro_raw, imu.T_BS)
 
         gravity = float(getattr(imu, "gravity", [9.81])[0]) if hasattr(imu, "gravity") else 9.81
         imu_world_frame = str(getattr(frame, "imu_world_frame", "NED"))
@@ -2242,8 +2249,12 @@ class MACVO(IOdometry[T_SensorFrame], ConfigTestable):
         # ── Current world-frame orientation for gravity alignment
         R0_world = None
         if self.prev_keyframe is not None:
-            prev_pose = pp.SE3(self.graph.frames.data["pose"][self.prev_keyframe[1]])
-            R0_world = prev_pose.rotation()
+            prev_pose_WC = pp.SE3(self.graph.frames.data["pose"][self.prev_keyframe[1]])
+            extrinsic_CI = self._frame_imu_vio_sensor_T_imu(frame).to(
+                device=prev_pose_WC.device,
+                dtype=prev_pose_WC.dtype,
+            )
+            R0_world = (prev_pose_WC @ extrinsic_CI).rotation()
             estimated_R0_world = R0_world
             if gravity_in_residual:
                 gravity_pose_source = "optimized_state"
@@ -2276,22 +2287,16 @@ class MACVO(IOdometry[T_SensorFrame], ConfigTestable):
                 gravity_rp_angle = float(alignment.correction_angle_rad)
                 gravity_rp_acc_norm = float(alignment.acc_norm)
 
-        # ── Use IMU noise density already normalized by the dataset loader when metadata
-        # declares whether sigma is per-sample or continuous-time density.
+        # The dataset loader exposes continuous-time IMU noise densities directly.
         has_calib = hasattr(frame, "imu_calib_acc_sigma") and hasattr(frame, "imu_calib_gyro_sigma")
         if has_calib:
             sigma_acc  = getattr(frame, "imu_calib_acc_sigma",  self.imu_sigma_acc)
             sigma_gyro = getattr(frame, "imu_calib_gyro_sigma", self.imu_sigma_gyro)
-            sigma_unit = str(getattr(frame, "imu_calib_sigma_unit", "unknown"))
             sigma_source = str(getattr(frame, "imu_calib_source", "frame_calibration"))
         else:
             sigma_acc  = self.imu_sigma_acc
             sigma_gyro = self.imu_sigma_gyro
-            sigma_unit = "config_default"
             sigma_source = "MACVO_config"
-        measurement_rate_hz = float(
-            getattr(frame, "imu_calib_measurement_rate_hz", 100.0)
-        )
 
         # Bias random walk from calibration (if available)
         if hasattr(frame, "imu_calib_acc_w_sigma") and hasattr(frame, "imu_calib_gyro_w_sigma"):
@@ -2323,17 +2328,15 @@ class MACVO(IOdometry[T_SensorFrame], ConfigTestable):
                         raise ValueError(
                             "sampling-aware covariance requires the raw-to-knot interpolation map"
                         )
-                    imu_transform = pp.SE3(
-                        torch.as_tensor(
-                            imu.T_BS.tensor()
-                            if isinstance(imu.T_BS, pp.LieTensor)
-                            else imu.T_BS,
-                            dtype=torch.float64,
-                            device=acc_raw.device,
-                        ).reshape(7)
-                    )
-                    sensor_to_internal_rotation = (
-                        imu_transform.rotation().matrix().reshape(3, 3).T
+                    raw_time_ns = getattr(frame, "imu_sampling_raw_time_ns", None)
+                    if raw_time_ns is None:
+                        raise ValueError(
+                            "sampling-aware covariance requires raw IMU timestamps"
+                        )
+                    sensor_to_internal_rotation = torch.eye(
+                        3,
+                        dtype=torch.float64,
+                        device=acc_raw.device,
                     )
                     if self.two_state_covariance_mode == SAMPLING_AWARE:
                         preint = replace_with_sampling_aware_covariance(
@@ -2343,18 +2346,13 @@ class MACVO(IOdometry[T_SensorFrame], ConfigTestable):
                             gyro_internal=gyro_raw,
                             knot_from_raw=knot_from_raw,
                             sensor_to_internal_rotation=sensor_to_internal_rotation,
-                            measurement_rate_hz=measurement_rate_hz,
+                            raw_time_ns=raw_time_ns,
                             sigma_acc=sigma_acc,
                             sigma_gyro=sigma_gyro,
                             acc_bias=vio_prev_acc_bias,
                             gyro_bias=vio_prev_gyro_bias,
                         )
                     else:
-                        raw_time_ns = getattr(frame, "imu_sampling_raw_time_ns", None)
-                        if raw_time_ns is None:
-                            raise ValueError(
-                                "SA-v2 requires raw IMU timestamps for shared-sample identity"
-                            )
                         sampling_v2_components = build_sampling_aware_covariance_components(
                             preint,
                             time_ns=time_ns,
@@ -2362,12 +2360,11 @@ class MACVO(IOdometry[T_SensorFrame], ConfigTestable):
                             gyro_internal=gyro_raw,
                             knot_from_raw=knot_from_raw,
                             sensor_to_internal_rotation=sensor_to_internal_rotation,
-                            measurement_rate_hz=measurement_rate_hz,
+                            raw_time_ns=raw_time_ns,
                             sigma_acc=sigma_acc,
                             sigma_gyro=sigma_gyro,
                             acc_bias=vio_prev_acc_bias,
                             gyro_bias=vio_prev_gyro_bias,
-                            raw_time_ns=raw_time_ns,
                         )
                         incoming_times = sampling_v2_components.incoming_raw_time_ns
                         outgoing_times = sampling_v2_components.outgoing_raw_time_ns
@@ -2658,18 +2655,12 @@ class MACVO(IOdometry[T_SensorFrame], ConfigTestable):
                 if self.imu_trans_prior_mode != "off" and self.imu_trans_prior_enable
                 else None
             ),
-            "noise_sigma_unit": sigma_unit,
             "noise_source": sigma_source,
             "imu_world_frame": imu_world_frame,
             "imu_source_world_frame": str(getattr(frame, "imu_source_world_frame", "")),
             "imu_source_measurement_frame": str(getattr(frame, "imu_source_measurement_frame", "")),
             "imu_internal_world_frame": str(getattr(frame, "imu_internal_world_frame", imu_world_frame)),
             "imu_internal_measurement_frame": str(getattr(frame, "imu_internal_measurement_frame", imu_world_frame)),
-            "imu_acc_unit": str(getattr(frame, "imu_acc_unit", "")),
-            "imu_gyro_unit": str(getattr(frame, "imu_gyro_unit", "")),
-            "imu_timestamp_unit": str(getattr(frame, "imu_timestamp_unit", "")),
-            "imu_time_offset_ns": getattr(frame, "imu_time_offset_ns", None),
-            "imu_time_offset_source": str(getattr(frame, "imu_time_offset_source", "")),
             "imu_gravity_source": str(getattr(frame, "imu_gravity_source", "")),
             "imu_metadata_gravity_m_s2": getattr(frame, "imu_metadata_gravity_m_s2", None),
             "preintegration_gravity_z": preintegration_gravity,
@@ -2975,7 +2966,16 @@ class MACVO(IOdometry[T_SensorFrame], ConfigTestable):
         q = self._gt_quaternions.get(int(timestamp_ns))
         if q is None:
             return None
-        return nwu_xyzw_quaternion_to_internal_so3(q, internal_world_frame=internal_world_frame)
+        rotation_WC = nwu_xyzw_quaternion_to_internal_so3(
+            q, internal_world_frame=internal_world_frame
+        )
+        try:
+            rotation_CI = pp.SE3(
+                self.graph.frames.data["imu_vio_sensor_T_imu"][0].float()
+            ).rotation()
+            return rotation_WC @ rotation_CI
+        except Exception:
+            return rotation_WC
 
     def enable_adaptive(self, gate, decisions_csv_path: str = "", version: str = "v1") -> None:
         """Enable adaptive mode with the given VisualHealthGate instance.
@@ -3493,11 +3493,6 @@ class MACVO(IOdometry[T_SensorFrame], ConfigTestable):
                 getattr(frame1, "imu_internal_measurement_frame", internal_world_frame),
             )
         ).upper()
-        imu_acc_unit = str((imu_diag or {}).get("imu_acc_unit", getattr(frame1, "imu_acc_unit", "")))
-        imu_gyro_unit = str((imu_diag or {}).get("imu_gyro_unit", getattr(frame1, "imu_gyro_unit", "")))
-        imu_timestamp_unit = str((imu_diag or {}).get("imu_timestamp_unit", getattr(frame1, "imu_timestamp_unit", "")))
-        imu_time_offset_ns = (imu_diag or {}).get("imu_time_offset_ns", getattr(frame1, "imu_time_offset_ns", None))
-        imu_time_offset_source = str((imu_diag or {}).get("imu_time_offset_source", getattr(frame1, "imu_time_offset_source", "")))
         imu_gravity_source = str((imu_diag or {}).get("imu_gravity_source", getattr(frame1, "imu_gravity_source", "")))
         imu_metadata_gravity_m_s2 = (imu_diag or {}).get(
             "imu_metadata_gravity_m_s2",
@@ -3555,6 +3550,7 @@ class MACVO(IOdometry[T_SensorFrame], ConfigTestable):
         init_velocity_error_norm = float("nan")
         est_velocity_error_norm = float("nan")
         gt_delta_R: pp.LieTensor | None = None
+        gt_delta_R_imu: pp.LieTensor | None = None
         d_gt_camera_body: torch.Tensor | None = None  # GT camera-origin delta in body_i frame
         d_gt_imu_body: torch.Tensor | None = None     # GT IMU-origin delta in body_i frame
 
@@ -3595,6 +3591,13 @@ class MACVO(IOdometry[T_SensorFrame], ConfigTestable):
                         )
                         # GT relative rotation: R_gt_i^T @ R_gt_j in MACVO internal frame
                         gt_delta_R = R_gt_i.Inv() @ R_gt_j
+                        try:
+                            rotation_CI = pp.SE3(
+                                self.graph.frames.data["imu_vio_sensor_T_imu"][from_idx].float()
+                            ).rotation()
+                            gt_delta_R_imu = rotation_CI.Inv() @ gt_delta_R @ rotation_CI
+                        except Exception:
+                            gt_delta_R_imu = None
                         gt_delta_R_angle = float(gt_delta_R.Log().tensor().norm().item())
                         rot_err = gt_delta_R.Inv() @ delta_R
                         rotation_error_angle = float(rot_err.Log().tensor().norm().item())
@@ -3668,8 +3671,10 @@ class MACVO(IOdometry[T_SensorFrame], ConfigTestable):
                     try:
                         sensor_T_imu = pp.SE3(self.graph.frames.data["imu_vio_sensor_T_imu"][from_idx].float())
                         camera_to_imu_body = sensor_T_imu.translation().reshape(3).float()
+                        rotation_CI_mat = sensor_T_imu.rotation().matrix().float().reshape(3, 3)
                     except Exception:
                         camera_to_imu_body = torch.zeros(3, dtype=torch.float32)
+                        rotation_CI_mat = torch.eye(3, dtype=torch.float32)
 
                     p_cam_i_internal = _nwu_vector_to_internal(gt_i_t)
                     p_cam_j_internal = _nwu_vector_to_internal(gt_j_t)
@@ -3678,7 +3683,8 @@ class MACVO(IOdometry[T_SensorFrame], ConfigTestable):
                     p_imu_i_internal = p_cam_i_internal + R_gt_i_mat @ camera_to_imu_body
                     p_imu_j_internal = p_cam_j_internal + R_gt_j_mat @ camera_to_imu_body
                     d_gt_imu_internal = p_imu_j_internal - p_imu_i_internal
-                    d_gt_imu_body = R_gt_i_mat.T @ d_gt_imu_internal
+                    R_gt_imu_i_mat = R_gt_i_mat @ rotation_CI_mat
+                    d_gt_imu_body = R_gt_imu_i_mat.T @ d_gt_imu_internal
                 else:
                     # Without GT attitude, the lever-arm correction cannot be formed.
                     # Fall back to the camera-origin delta so legacy datasets still log.
@@ -3697,7 +3703,6 @@ class MACVO(IOdometry[T_SensorFrame], ConfigTestable):
         imu_trans_prior_std_x = float("nan")
         imu_trans_prior_std_y = float("nan")
         imu_trans_prior_std_z = float("nan")
-        imu_noise_sigma_unit = ""
         imu_noise_source = ""
         delta_p_over_est = float("nan")
         delta_p_over_gt = float("nan")
@@ -3710,8 +3715,8 @@ class MACVO(IOdometry[T_SensorFrame], ConfigTestable):
                 dp = imu_diag["delta_p"].reshape(3)
                 dv = imu_diag["delta_v"].reshape(3)
                 imu_delta_R_angle = float(dr.Log().tensor().norm().item())
-                if gt_delta_R is not None:
-                    imu_rot_err = gt_delta_R.Inv() @ dr
+                if gt_delta_R_imu is not None:
+                    imu_rot_err = gt_delta_R_imu.Inv() @ dr
                     imu_rotation_error_angle = float(
                         imu_rot_err.Log().tensor().norm().item()
                     )
@@ -3723,7 +3728,6 @@ class MACVO(IOdometry[T_SensorFrame], ConfigTestable):
                 num_imu_samples = int(imu_diag.get("num_imu_samples", 0))
                 imu_dt = float(imu_diag.get("dt_total", float("nan")))
                 imu_trans_prior_mode = str(imu_diag.get("translation_prior_mode", ""))
-                imu_noise_sigma_unit = str(imu_diag.get("noise_sigma_unit", ""))
                 imu_noise_source = str(imu_diag.get("noise_source", ""))
                 prior_std_diag = imu_diag.get("translation_prior_std_diag")
                 if prior_std_diag is not None:
@@ -3900,17 +3904,11 @@ class MACVO(IOdometry[T_SensorFrame], ConfigTestable):
             imu_trans_prior_std_x=imu_trans_prior_std_x,
             imu_trans_prior_std_y=imu_trans_prior_std_y,
             imu_trans_prior_std_z=imu_trans_prior_std_z,
-            imu_noise_sigma_unit=imu_noise_sigma_unit,
             imu_noise_source=imu_noise_source,
             imu_source_world_frame=source_world_frame,
             imu_source_measurement_frame=source_measurement_frame,
             imu_internal_world_frame=internal_world_frame,
             imu_internal_measurement_frame=internal_measurement_frame,
-            imu_acc_unit=imu_acc_unit,
-            imu_gyro_unit=imu_gyro_unit,
-            imu_timestamp_unit=imu_timestamp_unit,
-            imu_time_offset_ns=imu_time_offset_ns,
-            imu_time_offset_source=imu_time_offset_source,
             imu_gravity_source=imu_gravity_source,
             imu_metadata_gravity_m_s2=imu_metadata_gravity_m_s2,
             imu_preintegration_gravity_z=imu_preintegration_gravity_z,
@@ -4085,7 +4083,7 @@ class MACVO(IOdometry[T_SensorFrame], ConfigTestable):
                 if source_measurement_frame and internal_measurement_frame and source_measurement_frame != internal_measurement_frame
                 else (internal_measurement_frame or internal_world_frame)
             ),
-            imu_delta_frame=f"{internal_world_frame}_body_i",
+            imu_delta_frame=f"{internal_measurement_frame}_i",
             # Adaptive mode annotations
             adaptive_mode=(self._adaptive_decision.mode if self._adaptive_decision else ""),
             adaptive_use_rotation=(self._adaptive_decision.use_imu_rotation if self._adaptive_decision else ""),

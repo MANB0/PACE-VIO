@@ -12,9 +12,18 @@ from Utility.TwoStateVIO import (
 )
 
 
+EXTRINSIC_CI = pp.from_matrix(torch.tensor([[
+    [1.0, 0.0, 0.0, -0.417],
+    [0.0, -1.0, 0.0, 0.180],
+    [0.0, 0.0, -1.0, 0.095],
+    [0.0, 0.0, 0.0, 1.0],
+]], dtype=torch.float64), pp.SE3_type)
+
+
 def _state(x: float) -> NavigationState:
-    pose = pp.identity_SE3(1, dtype=torch.float64).tensor()
-    pose[0, 0] = x
+    pose_WC = pp.identity_SE3(1, dtype=torch.float64)
+    pose_WC.tensor()[0, 0] = x
+    pose = (pose_WC @ EXTRINSIC_CI).tensor()
     return NavigationState(
         pose_WB=pose,
         velocity_W=torch.tensor([0.1, 0.0, 0.0], dtype=torch.float64),
@@ -23,14 +32,21 @@ def _state(x: float) -> NavigationState:
     )
 
 
-def _packet(frame_i: int, frame_j: int, x_i: float, x_j: float) -> T2FactorPacket:
-    identity = pp.identity_SE3(1, dtype=torch.float64).tensor()
+def _packet(
+    frame_i: int,
+    frame_j: int,
+    x_i: float,
+    x_j: float,
+    *,
+    state_i: NavigationState | None = None,
+) -> T2FactorPacket:
+    extrinsic = EXTRINSIC_CI.tensor()
     covariance = torch.eye(9, dtype=torch.float64) * 1.0e-3
     bias_covariance = torch.eye(6, dtype=torch.float64) * 1.0e-6
     return T2FactorPacket.create(
         frame_i=frame_i,
         frame_j=frame_j,
-        state_i_initial=_state(x_i),
+        state_i_initial=_state(x_i) if state_i is None else state_i,
         state_j_initial=_state(x_j),
         imu=ImuPreintegrationFactor(
             delta_rotation=torch.zeros(3, dtype=torch.float64),
@@ -51,10 +67,10 @@ def _packet(frame_i: int, frame_j: int, x_i: float, x_j: float) -> T2FactorPacke
             ).Exp().tensor(),
             sqrt_information=torch.eye(6, dtype=torch.float64) * 10.0,
             residual_offset=torch.zeros(6, dtype=torch.float64),
-            extrinsic_CI=identity,
+            extrinsic_CI=extrinsic,
             marginal_mode="full",
         ),
-        extrinsic_CI=identity,
+        extrinsic_CI=extrinsic,
     )
 
 
@@ -73,7 +89,14 @@ def _backend() -> IncrementalT2ISAM2Backend:
 def test_incremental_backend_consumes_packets_and_revises_history():
     backend = _backend()
     first = backend.consume(_packet(90, 91, 0.0, 0.01))
-    second = backend.consume(_packet(91, 92, first.state.pose_WB[0, 0].item(), 0.02))
+    first_camera = pp.SE3(first.state.pose_WB) @ EXTRINSIC_CI.Inv()
+    second = backend.consume(_packet(
+        91,
+        92,
+        first_camera.translation()[0, 0].item(),
+        0.02,
+        state_i=first.state,
+    ))
     history = backend.history()
 
     assert first.frame_idx == 91
@@ -96,8 +119,13 @@ def test_optimizer_finalize_returns_one_complete_isam2_history_snapshot():
     backend = _backend()
     first_packet = _packet(90, 91, 0.0, 0.01)
     first = backend.consume(first_packet)
+    first_camera = pp.SE3(first.state.pose_WB) @ EXTRINSIC_CI.Inv()
     second_packet = _packet(
-        91, 92, first.state.pose_WB[0, 0].item(), 0.02
+        91,
+        92,
+        first_camera.translation()[0, 0].item(),
+        0.02,
+        state_i=first.state,
     )
     backend.consume(second_packet)
     context = {

@@ -41,6 +41,27 @@ SAMPLING_AWARE = "sampling_aware"
 SAMPLING_AWARE_CROSS_EDGE = "sampling_aware_cross_edge"
 
 
+def _raw_sample_periods_s(
+    raw_time_ns: torch.Tensor,
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return validated timestamps and one support period per raw sample."""
+    stamps = torch.as_tensor(raw_time_ns).reshape(-1).to(device=device, dtype=torch.long)
+    if stamps.numel() < 2:
+        raise ValueError("sampling-aware covariance requires at least two raw IMU samples")
+    intervals_s = (stamps[1:] - stamps[:-1]).to(dtype) * 1e-9
+    if bool((intervals_s <= 0.0).any().item()):
+        raise ValueError("raw IMU timestamps must be strictly increasing")
+    periods_s = torch.empty(stamps.numel(), device=device, dtype=dtype)
+    periods_s[0] = intervals_s[0]
+    periods_s[-1] = intervals_s[-1]
+    if stamps.numel() > 2:
+        periods_s[1:-1] = 0.5 * (intervals_s[:-1] + intervals_s[1:])
+    return stamps, periods_s
+
+
 def normalize_preintegration_covariance_mode(value: str | None) -> str:
     mode = CURRENT_INDEPENDENT_STEP if value is None else str(value).strip().lower()
     if mode == "sampling_aware_v2":
@@ -243,7 +264,8 @@ def preintegrate_imu(
         # Gravity-corrected acceleration in body_i frame.
         # Standard specific force model: a_meas = a_kinematic - g_body
         # Therefore: a_kinematic = a_meas + g_body
-        # (After FLU→NED rotation, stationary acc_z_NED = -g; +g_body_i = +g → cancels to 0.)
+        # In the standard local-frame path gravity is not added here. The raw
+        # measurement frame is preserved and gravity appears only in the factor.
         a_corr = delta_R.Act(acc_mid)
         if gravity_mode == LEGACY_EXTERNAL_ATTITUDE_GRAVITY_COMPENSATION:
             assert g_body_i is not None
@@ -383,12 +405,11 @@ def build_sampling_aware_covariance_components(
     gyro_internal: torch.Tensor,
     knot_from_raw: torch.Tensor,
     sensor_to_internal_rotation: torch.Tensor,
-    measurement_rate_hz: float,
+    raw_time_ns: torch.Tensor,
     sigma_acc: float | list[float] | tuple[float, ...] | torch.Tensor,
     sigma_gyro: float | list[float] | tuple[float, ...] | torch.Tensor,
     acc_bias: torch.Tensor,
     gyro_bias: torch.Tensor,
-    raw_time_ns: torch.Tensor | None = None,
 ) -> SamplingAwareCovarianceComponents:
     """Build the within-edge covariance and its endpoint-sample decomposition.
 
@@ -407,8 +428,13 @@ def build_sampling_aware_covariance_components(
         raise ValueError(
             "sampling-aware covariance requires one interpolation-map row per IMU knot"
         )
-    if measurement_rate_hz <= 0.0:
-        raise ValueError("measurement_rate_hz must be positive")
+    raw_time_ns, raw_sample_periods_s = _raw_sample_periods_s(
+        raw_time_ns, device=device, dtype=dtype
+    )
+    if raw_time_ns.numel() != knot_from_raw.shape[1]:
+        raise ValueError(
+            "raw_time_ns must contain one timestamp per raw interpolation column"
+        )
 
     dt_s = (time_ns[1:] - time_ns[:-1]).to(dtype).clamp(min=1.0) * 1e-9
     nominal_acc_mid = 0.5 * (acc_internal[:-1] + acc_internal[1:])
@@ -460,10 +486,12 @@ def build_sampling_aware_covariance_components(
 
     sigma_acc_axis = _axis_noise_density(sigma_acc, device=device, dtype=dtype)
     sigma_gyro_axis = _axis_noise_density(sigma_gyro, device=device, dtype=dtype)
-    raw_variance = torch.cat(
+    density_variance = torch.cat(
         [sigma_acc_axis.square(), sigma_gyro_axis.square()]
-    ) * float(measurement_rate_hz)
-    raw_variance = raw_variance.repeat(knot_from_raw.shape[1])
+    )
+    raw_variance = (
+        density_variance.reshape(1, 6) / raw_sample_periods_s.reshape(-1, 1)
+    ).reshape(-1)
     standardized_sensitivity = jacobian_raw * raw_variance.sqrt().reshape(1, -1)
     sampling_measurement_cov = standardized_sensitivity @ standardized_sensitivity.T
     sampling_measurement_cov = 0.5 * (
@@ -509,14 +537,6 @@ def build_sampling_aware_covariance_components(
     unique_covariance = unique_covariance + bias_process_cov.to(device=device, dtype=dtype)
     unique_covariance = 0.5 * (unique_covariance + unique_covariance.T)
 
-    if raw_time_ns is None:
-        raw_time_ns = torch.arange(knot_from_raw.shape[1], device=device, dtype=torch.long)
-    else:
-        raw_time_ns = raw_time_ns.reshape(-1).to(device=device, dtype=torch.long)
-        if raw_time_ns.numel() != knot_from_raw.shape[1]:
-            raise ValueError(
-                "raw_time_ns must contain one timestamp per raw interpolation column"
-            )
     return SamplingAwareCovarianceComponents(
         total_covariance=sampling_total_cov,
         measurement_covariance=sampling_measurement_cov,
@@ -537,7 +557,7 @@ def replace_with_sampling_aware_covariance(
     gyro_internal: torch.Tensor,
     knot_from_raw: torch.Tensor,
     sensor_to_internal_rotation: torch.Tensor,
-    measurement_rate_hz: float,
+    raw_time_ns: torch.Tensor,
     sigma_acc: float | list[float] | tuple[float, ...] | torch.Tensor,
     sigma_gyro: float | list[float] | tuple[float, ...] | torch.Tensor,
     acc_bias: torch.Tensor,
@@ -551,7 +571,7 @@ def replace_with_sampling_aware_covariance(
         gyro_internal=gyro_internal,
         knot_from_raw=knot_from_raw,
         sensor_to_internal_rotation=sensor_to_internal_rotation,
-        measurement_rate_hz=measurement_rate_hz,
+        raw_time_ns=raw_time_ns,
         sigma_acc=sigma_acc,
         sigma_gyro=sigma_gyro,
         acc_bias=acc_bias,

@@ -19,7 +19,6 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from Scripts.evaluate_t2_history_smoother import (  # noqa: E402
-    FLU_TO_NED,
     evaluate_method,
     interpolate_rows,
     select_truth,
@@ -210,11 +209,11 @@ def main() -> None:
         acc_bias_truth = interpolate_rows(
             dataset / "imu_truth_decomposition.csv", timestamps, "timestamp",
             ["acc_bias_x", "acc_bias_y", "acc_bias_z"],
-        ) @ FLU_TO_NED.T
+        )
         gyro_bias_truth = interpolate_rows(
             dataset / "imu_truth_decomposition.csv", timestamps, "timestamp",
             ["gyro_bias_x", "gyro_bias_y", "gyro_bias_z"],
-        ) @ FLU_TO_NED.T
+        )
 
         metric = evaluate_method(
             "real_frontend_t2_isam2", live, truth,

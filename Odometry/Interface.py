@@ -11,7 +11,11 @@ from abc import ABC, abstractmethod
 from Utility.Sandbox import Sandbox
 from DataLoader import SequenceBase, T_Data
 from Module.Map import VisualMap
-from Utility.PoseFrame import convert_pose_frame, write_timed_se3_csv
+from Utility.PoseFrame import (
+    convert_pose_frame,
+    convert_pose_world_frame_only,
+    write_timed_se3_csv,
+)
 from Utility.TrajectoryReference import (
     compose_camera_to_imu_poses,
     constant_camera_T_imu,
@@ -65,7 +69,7 @@ class IOdometry(ABC, Generic[T_Data]):
                     camera_poses_internal,
                     camera_T_imu_all,
                 )
-                imu_poses_output = convert_pose_frame(
+                imu_poses_output = convert_pose_world_frame_only(
                     imu_poses_internal,
                     "NED",
                     pose_output_frame,
@@ -82,8 +86,12 @@ class IOdometry(ABC, Generic[T_Data]):
                             "poses.csv": "visual_sensor_origin (camera for current HoloOcean runs)",
                             "poses_imu.csv": "IMU origin used by VIO state T_WI",
                             "runtime_extrinsic_field": "frames//imu_vio_sensor_T_imu",
-                            "runtime_extrinsic_semantics": "T_CI; T_WI = T_WC * T_CI",
-                            "runtime_extrinsic_internal_frame": "NED",
+                            "runtime_extrinsic_semantics": (
+                                "T_CI maps raw IMU frame I to MACVO camera frame C; "
+                                "p_C = T_CI p_I and T_WI = T_WC * T_CI"
+                            ),
+                            "runtime_imu_local_frame": "raw IMU FLU",
+                            "runtime_world_frame": "NED",
                             "runtime_T_CI_xyzw": camera_T_imu.tolist(),
                             "output_world_frame": pose_output_frame,
                         },

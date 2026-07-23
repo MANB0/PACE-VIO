@@ -4,6 +4,8 @@ import pypose as pp
 import pytest
 import torch
 
+from DataLoader.Dataset.GeneralStereoIMU import _continuous_imu_noise_density
+from Module.IMUPreintegration import _raw_sample_periods_s
 from Odometry.MACVO import MACVO
 from Scripts.run_realtime_t2 import validate_static_initialization_options
 from Utility.IMUKinematics import (
@@ -37,6 +39,54 @@ def _static_imu(duration_s: float = 3.2, rate_hz: int = 100):
     gyro = gyro_bias + 0.018 * torch.randn(count, 3)
     acc = torch.tensor([0.0, 0.0, 9.8]) + acc_bias + 0.14 * torch.randn(count, 3)
     return stamps, acc, gyro
+
+
+def test_continuous_density_metadata_preserves_scalar_and_axis_values():
+    assert _continuous_imu_noise_density({"NoiseAcc": 0.014}, "NoiseAcc") == 0.014
+    assert _continuous_imu_noise_density(
+        {"NoiseGyroXYZ": [0.001, 0.002, 0.003]}, "NoiseGyro"
+    ) == (0.001, 0.002, 0.003)
+    with pytest.raises(ValueError, match="finite non-negative"):
+        _continuous_imu_noise_density({"AccWalk": [0.1, -0.2, 0.3]}, "AccWalk")
+
+
+def test_timestamp_based_density_discretization_matches_regular_rate():
+    base = 1_720_000_000_000_000_000
+    stamps_100_hz = torch.tensor(
+        [base, base + 10_000_000, base + 20_000_000], dtype=torch.long
+    )
+    density = torch.tensor([0.01, 0.02, 0.03], dtype=torch.float64)
+    sample_sigma = MACVO._imu_sample_sigma(
+        density, stamps_100_hz, floor=0.0, multiplier=1.0
+    )
+    assert torch.allclose(sample_sigma, density * 10.0, atol=1e-12, rtol=1e-12)
+
+    _, periods_s = _raw_sample_periods_s(
+        stamps_100_hz, device=torch.device("cpu"), dtype=torch.float64
+    )
+    expected_variance = density.square().reshape(1, 3) / periods_s.reshape(-1, 1)
+    assert torch.allclose(
+        expected_variance,
+        density.square().reshape(1, 3).repeat(3, 1) * 100.0,
+        atol=1e-12,
+        rtol=1e-12,
+    )
+
+
+def test_irregular_timestamps_define_per_sample_support_periods():
+    base = 1_720_000_000_000_000_000
+    stamps = torch.tensor(
+        [base, base + 10_000_000, base + 30_000_000], dtype=torch.long
+    )
+    _, periods_s = _raw_sample_periods_s(
+        stamps, device=torch.device("cpu"), dtype=torch.float64
+    )
+    assert torch.allclose(
+        periods_s,
+        torch.tensor([0.01, 0.015, 0.02], dtype=torch.float64),
+        atol=1e-15,
+        rtol=1e-15,
+    )
 
 
 def test_static_mode_contract_requires_explicit_fixed_duration():
@@ -192,7 +242,6 @@ def test_macvo_fixed_and_adaptive_modes_write_the_same_state_contract(
     stamps, acc, gyro = _static_imu()
     system = _macvo_static_state(mode, duration_s)
     frame = SimpleNamespace(
-        imu_calib_measurement_rate_hz=100.0,
         imu_calib_acc_sigma=0.014,
         imu_calib_gyro_sigma=0.0018,
     )
@@ -223,7 +272,6 @@ def test_zero_state_policy_discards_estimate_at_same_adaptive_boundary():
     stamps, acc, gyro = _static_imu()
     system = _macvo_static_state("adaptive", state_policy="zero")
     frame = SimpleNamespace(
-        imu_calib_measurement_rate_hz=100.0,
         imu_calib_acc_sigma=0.014,
         imu_calib_gyro_sigma=0.0018,
     )

@@ -12,32 +12,49 @@ from typing import Any
 
 from ..Interface import StereoFrame, StereoInertialFrame, StereoData, IMUData
 from ..SequenceBase import SequenceBase
-from Utility.IMUKinematics import (
-    format_imu_sigma,
-    imu_bias_sigma_to_continuous_random_walk_density,
-    imu_sigma_to_continuous_density,
-)
+from Utility.IMUKinematics import format_imu_sigma, is_valid_imu_sigma
 from Utility.IMUCSV import IMUCSVLoader
 from Utility.PrettyPrint import Logger
 
 
-def _flu_to_ned_se3() -> pp.LieTensor:
-    # PyPose SE3 stores quaternions as qx, qy, qz, qw.
-    return pp.SE3(torch.tensor(
-        [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0],
-        dtype=torch.float64,
-    ).reshape(1, 7))
+def _load_t_ci(extrinsics: dict | None) -> pp.LieTensor:
+    """Load the sole camera/IMU extrinsic, p_C = T_CI p_I."""
+    if not isinstance(extrinsics, dict) or "T_CI" not in extrinsics:
+        raise ValueError(
+            "metadata.extrinsics.T_CI is required and must be a 4x4 transform "
+            "mapping the raw IMU measurement frame I to the MACVO camera frame C"
+        )
+    unexpected = sorted(set(extrinsics) - {"T_CI"})
+    if unexpected:
+        raise ValueError(
+            "metadata.extrinsics must contain only T_CI; remove legacy or duplicate "
+            f"extrinsics: {unexpected}"
+        )
 
+    matrix = torch.as_tensor(extrinsics["T_CI"], dtype=torch.float64)
+    if matrix.shape != (4, 4):
+        raise ValueError(f"metadata.extrinsics.T_CI must have shape 4x4, got {tuple(matrix.shape)}")
+    if not torch.isfinite(matrix).all():
+        raise ValueError("metadata.extrinsics.T_CI contains NaN or Inf")
+    if not torch.allclose(
+        matrix[3],
+        torch.tensor([0.0, 0.0, 0.0, 1.0], dtype=matrix.dtype),
+        atol=1e-10,
+        rtol=0.0,
+    ):
+        raise ValueError("metadata.extrinsics.T_CI must have homogeneous bottom row [0, 0, 0, 1]")
 
-def _body_nwu_translation_to_internal_ned(translation: list[float]) -> list[float]:
-    return [float(translation[0]), -float(translation[1]), -float(translation[2])]
-
-
-def _translation_se3(translation: list[float]) -> pp.LieTensor:
-    return pp.SE3(torch.tensor(
-        [[float(translation[0]), float(translation[1]), float(translation[2]), 0.0, 0.0, 0.0, 1.0]],
-        dtype=torch.float64,
-    ))
+    rotation = matrix[:3, :3]
+    identity = torch.eye(3, dtype=matrix.dtype)
+    if not torch.allclose(rotation.T @ rotation, identity, atol=1e-7, rtol=1e-7):
+        raise ValueError("metadata.extrinsics.T_CI rotation is not orthonormal")
+    determinant = float(torch.linalg.det(rotation).item())
+    if abs(determinant - 1.0) > 1e-7:
+        raise ValueError(
+            "metadata.extrinsics.T_CI rotation must be proper (det=+1), "
+            f"got det={determinant:.9g}"
+        )
+    return pp.from_matrix(matrix.unsqueeze(0), pp.SE3_type)
 
 
 def _imu_calibration_axis_value(imu_calib: dict, key: str):
@@ -51,55 +68,23 @@ def _imu_calibration_axis_value(imu_calib: dict, key: str):
     return value
 
 
-def _metadata_uses_holoocean_nwu_flu(meta: dict | None) -> bool:
-    if not meta:
-        return False
-    coord = meta.get("coordinate_convention", {})
-    imu_meta = meta.get("imu", {})
-    world_frame = str(coord.get("export_world_frame", coord.get("holocean_world_frame", ""))).upper()
-    body_frame = str(coord.get("body_frame", "")).upper()
-    camera_frame = str(coord.get("camera_frame", "")).upper()
-    imu_frame = str(coord.get("imu_measurement_frame", imu_meta.get("frame", ""))).upper()
-    return (
-        "NWU" in world_frame
-        and "NWU" in body_frame
-        and "FLU" in imu_frame
-        and ("BODY NWU" in camera_frame or "ALIGNED" in camera_frame)
-    )
+def _continuous_imu_noise_density(imu_calib: dict, key: str):
+    """Read one continuous-time density as an isotropic or three-axis value."""
+    value = _imu_calibration_axis_value(imu_calib, key)
+    if not is_valid_imu_sigma(value):
+        raise ValueError(
+            f"imu.{key} must be a finite non-negative scalar or three-axis density"
+        )
+    values = torch.as_tensor(value, dtype=torch.float64).reshape(-1)
+    if values.numel() == 1:
+        return float(values.item())
+    return tuple(float(axis) for axis in values.tolist())
 
 
-def _canonical_unit(value: object) -> str:
-    return str(value).strip().lower().replace(" ", "").replace("²", "^2")
-
-
-def _validate_imu_metadata_conventions(meta: dict | None) -> dict[str, Any]:
+def _metadata_gravity_m_s2(meta: dict | None) -> float | None:
     imu_meta = meta.get("imu", {}) if meta else {}
-    ts_meta = meta.get("time_synchronization", {}) if meta else {}
-    dataset_meta = meta.get("dataset", {}) if meta else {}
-
-    acc_unit = imu_meta.get("acc_unit", "m/s^2")
-    gyro_unit = imu_meta.get("gyro_unit", "rad/s")
-    timestamp_unit = ts_meta.get("timestamp_unit", dataset_meta.get("timestamp_unit", "ns"))
-    acc_includes_gravity = imu_meta.get("acc_includes_gravity", True)
     gravity_m_s2 = imu_meta.get("gravity_m_s2", None)
-
-    if _canonical_unit(acc_unit) not in {"m/s^2", "m/s2"}:
-        raise ValueError(f"Unsupported IMU acc_unit={acc_unit!r}; expected m/s^2")
-    if _canonical_unit(gyro_unit) != "rad/s":
-        raise ValueError(f"Unsupported IMU gyro_unit={gyro_unit!r}; expected rad/s")
-    if _canonical_unit(timestamp_unit) != "ns":
-        raise ValueError(f"Unsupported timestamp_unit={timestamp_unit!r}; expected ns")
-    if not bool(acc_includes_gravity):
-        raise ValueError("Unsupported imu.acc_includes_gravity=False; current preintegration expects gravity-inclusive acceleration")
-
-    gravity_value = None if gravity_m_s2 is None else float(gravity_m_s2)
-    return {
-        "acc_unit": "m/s^2",
-        "gyro_unit": "rad/s",
-        "timestamp_unit": "ns",
-        "acc_includes_gravity": True,
-        "gravity_m_s2": gravity_value,
-    }
+    return None if gravity_m_s2 is None else float(gravity_m_s2)
 
 
 class MonocularDataset:
@@ -145,9 +130,6 @@ class GeneralStereoIMUSequence(SequenceBase[StereoInertialFrame]):
         self.gravity_source = "config"
         self.imu_window_ns = int(getattr(cfg, "imu_window_ns", 100_000_000))
         self.imu_fallback_max_dt_ns = int(getattr(cfg, "imu_fallback_max_dt_ns", 50_000_000))
-        self.auto_estimate_time_offset = bool(getattr(cfg, "auto_estimate_time_offset", True))
-        self.imu_time_offset_ns = int(getattr(cfg, "imu_time_offset_ns", 0))
-        self.imu_time_offset_source = "config"
 
         self.cam_T_BS = pp.identity_SE3(1, dtype=torch.float64)
         self.imu_vio_sensor_T_imu = pp.identity_SE3(1, dtype=torch.float64)
@@ -189,51 +171,28 @@ class GeneralStereoIMUSequence(SequenceBase[StereoInertialFrame]):
                 self.K = torch.tensor(np.load(Path(self.seq_root, "intrinsic.npy")), dtype=torch.float32)
             self.baseline = float(getattr(cfg, "bl", 0.225))
             Logger.write("info", "No camera_metadata.json, using config/npy defaults")
-        # ── imu_T_BS: body-to-sensor extrinsic; IMU samples use inverse rotation
-        #    when they are converted back into the optimizer body frame.
-        self.imu_source_world_frame = "NED"
+        # Raw IMU samples remain in their CSV frame throughout initialization and
+        # preintegration. T_CI is used only at camera/IMU pose boundaries.
+        self.imu_source_world_frame = "NWU"
         self.imu_source_measurement_frame = "FLU"
         self.imu_internal_world_frame = "NED"
-        self.imu_internal_measurement_frame = "NED"
+        self.imu_internal_measurement_frame = "FLU"
         self.imu_world_frame = "NED"
         self.imu_measurement_frame = "FLU"
-        self.imu_acc_unit = "m/s^2"
-        self.imu_gyro_unit = "rad/s"
-        self.imu_timestamp_unit = "ns"
-        self.imu_metadata_gravity_m_s2 = None
-        self.imu_acc_includes_gravity = True
-        imu_conventions = _validate_imu_metadata_conventions(meta)
-        self.imu_acc_unit = imu_conventions["acc_unit"]
-        self.imu_gyro_unit = imu_conventions["gyro_unit"]
-        self.imu_timestamp_unit = imu_conventions["timestamp_unit"]
-        self.imu_acc_includes_gravity = imu_conventions["acc_includes_gravity"]
-        self.imu_metadata_gravity_m_s2 = imu_conventions["gravity_m_s2"]
+        self.imu_metadata_gravity_m_s2 = _metadata_gravity_m_s2(meta)
         if self.imu_metadata_gravity_m_s2 is not None:
             self.gravity = float(self.imu_metadata_gravity_m_s2)
             self.gravity_source = "metadata.json"
-        if _metadata_uses_holoocean_nwu_flu(meta):
-            self.imu_T_BS = _flu_to_ned_se3()
-            self.imu_source_world_frame = "NWU"
-            self.imu_source_measurement_frame = "FLU"
-            self.imu_internal_world_frame = "NED"
-            self.imu_internal_measurement_frame = "NED"
-            self.imu_world_frame = self.imu_internal_world_frame
-            Logger.write("info", "imu_T_BS rotation is set from metadata-declared HoloOcean FLU/NWU to MACVO internal NED convention")
-        else:
-            # Legacy path: FLU (x-fwd,y-left,z-up) → NED (x-fwd,y-right,z-down).
-            self.imu_T_BS = _flu_to_ned_se3()
-            Logger.write("info", "imu_T_BS rotation set to R_x(180°) for legacy FLU/NED convention")
+        self.imu_T_BS = pp.identity_SE3(1, dtype=torch.float64)
+        self.imu_world_frame = self.imu_internal_world_frame
+        Logger.write("info", "Raw IMU samples remain in FLU; no hidden FLU/NED pre-rotation is applied")
 
         # ── IMU calibration & extrinsic ─────────────────────────────────
         self.imu_calib_acc_sigma = None
         self.imu_calib_gyro_sigma = None
         self.imu_calib_acc_w_sigma = None
         self.imu_calib_gyro_w_sigma = None
-        self.imu_calib_sigma_unit = None
-        self.imu_calib_bias_sigma_unit = None
         self.imu_calib_source = None
-        self.imu_calib_measurement_rate_hz = None
-        self.imu_calib_bias_random_walk_update_hz = None
 
         imu_calib = meta.get("imu", None) if meta else None
         imu_extrinsic = meta.get("extrinsics", None) if meta else None
@@ -251,107 +210,33 @@ class GeneralStereoIMUSequence(SequenceBase[StereoInertialFrame]):
                 except Exception as e:
                     Logger.write("warn", f"Failed to parse imu_calibration.yaml: {e}")
 
-        if imu_calib is not None and "AccelSigma" in imu_calib and "AngVelSigma" in imu_calib:
-            rate_hz = float(imu_calib.get("rate_hz", 100))
-            bias_rate_hz = float(imu_calib.get("bias_random_walk_update_hz", rate_hz))
-            sigma_unit = imu_calib.get("sigma_unit", "legacy_sqrt_rate_scaled")
-            bias_sigma_unit = imu_calib.get("bias_sigma_unit", sigma_unit)
-            self.imu_calib_measurement_rate_hz = rate_hz
-            self.imu_calib_bias_random_walk_update_hz = bias_rate_hz
-            self.imu_calib_sigma_unit = str(sigma_unit)
-            self.imu_calib_bias_sigma_unit = str(bias_sigma_unit)
-            self.imu_calib_acc_sigma = imu_sigma_to_continuous_density(
-                _imu_calibration_axis_value(imu_calib, "AccelSigma"), rate_hz, sigma_unit
-            )
-            self.imu_calib_gyro_sigma = imu_sigma_to_continuous_density(
-                _imu_calibration_axis_value(imu_calib, "AngVelSigma"), rate_hz, sigma_unit
-            )
-            if "AccelBiasSigma" in imu_calib:
-                self.imu_calib_acc_w_sigma = imu_bias_sigma_to_continuous_random_walk_density(
-                    _imu_calibration_axis_value(imu_calib, "AccelBiasSigma"),
-                    bias_rate_hz,
-                    bias_sigma_unit,
+        if imu_calib is not None:
+            required_noise_fields = {"NoiseAcc", "NoiseGyro", "AccWalk", "GyroWalk"}
+            missing_noise_fields = sorted(required_noise_fields.difference(imu_calib))
+            if missing_noise_fields:
+                raise ValueError(
+                    "IMU metadata must provide continuous-time densities "
+                    f"{sorted(required_noise_fields)}; missing {missing_noise_fields}"
                 )
-            if "AngVelBiasSigma" in imu_calib:
-                self.imu_calib_gyro_w_sigma = imu_bias_sigma_to_continuous_random_walk_density(
-                    _imu_calibration_axis_value(imu_calib, "AngVelBiasSigma"),
-                    bias_rate_hz,
-                    bias_sigma_unit,
-                )
+            self.imu_calib_acc_sigma = _continuous_imu_noise_density(imu_calib, "NoiseAcc")
+            self.imu_calib_gyro_sigma = _continuous_imu_noise_density(imu_calib, "NoiseGyro")
+            self.imu_calib_acc_w_sigma = _continuous_imu_noise_density(imu_calib, "AccWalk")
+            self.imu_calib_gyro_w_sigma = _continuous_imu_noise_density(imu_calib, "GyroWalk")
             Logger.write("info",
                 f"IMU calib: sigma_a={format_imu_sigma(self.imu_calib_acc_sigma)}, "
                 f"sigma_g={format_imu_sigma(self.imu_calib_gyro_sigma)}, "
                 f"sigma_aw={format_imu_sigma(self.imu_calib_acc_w_sigma)}, "
                 f"sigma_gw={format_imu_sigma(self.imu_calib_gyro_w_sigma)}, "
-                f"measurement_rate_hz={rate_hz:g}, bias_update_rate_hz={bias_rate_hz:g}, "
-                f"sigma_unit={self.imu_calib_sigma_unit}, bias_sigma_unit={self.imu_calib_bias_sigma_unit}")
+                "continuous-time densities consumed directly")
 
-        # IMU extrinsic → imu_T_BS translation. For HoloOcean metadata, T_body_imu
-        # matches IMUData.T_BS semantics and is converted from body NWU to the
-        # MACVO internal NED frame. Older fallback metadata may only expose an
-        # imu-camera translation; keep that path for compatibility.
-        if imu_extrinsic is not None:
-            trans = None
-            trans_source = ""
-            sensor_imu_set = False
-            if _metadata_uses_holoocean_nwu_flu(meta):
-                t_body_imu = imu_extrinsic.get("T_body_imu", {})
-                body_imu_trans = t_body_imu.get("translation_body_nwu_m", None)
-                if body_imu_trans and len(body_imu_trans) == 3:
-                    trans = _body_nwu_translation_to_internal_ned(body_imu_trans)
-                    trans_source = "metadata.json T_body_imu converted NWU→NED"
-                t_body_camera = imu_extrinsic.get("T_body_camera", {})
-                body_camera_trans = t_body_camera.get("translation_body_nwu_m", None)
-                if body_imu_trans and len(body_imu_trans) == 3 and body_camera_trans and len(body_camera_trans) == 3:
-                    camera_imu_trans_nwu = [
-                        float(body_imu_trans[axis]) - float(body_camera_trans[axis])
-                        for axis in range(3)
-                    ]
-                    camera_imu_trans = _body_nwu_translation_to_internal_ned(camera_imu_trans_nwu)
-                    self.imu_vio_sensor_T_imu = _translation_se3(camera_imu_trans)
-                    sensor_imu_set = True
-                    Logger.write(
-                        "info",
-                        "imu_vio_sensor_T_imu from T_body_imu - T_body_camera "
-                        f"converted NWU→NED: {camera_imu_trans}",
-                    )
-            t_imu_cam = imu_extrinsic.get("T_imu_camera", {})
-            imu_camera_trans = t_imu_cam.get("translation_body_nwu_m", None)
-            if trans is None:
-                trans = imu_camera_trans
-                trans_source = "metadata.json T_imu_camera fallback"
-            if not sensor_imu_set and imu_camera_trans and len(imu_camera_trans) == 3:
-                camera_imu_trans_nwu = [-float(imu_camera_trans[axis]) for axis in range(3)]
-                camera_imu_trans = _body_nwu_translation_to_internal_ned(camera_imu_trans_nwu)
-                self.imu_vio_sensor_T_imu = _translation_se3(camera_imu_trans)
-                Logger.write(
-                    "info",
-                    "imu_vio_sensor_T_imu from -T_imu_camera fallback "
-                    f"converted NWU→NED: {camera_imu_trans}",
-                )
-            if trans and len(trans) == 3:
-                tbs = self.imu_T_BS.tensor().reshape(-1).tolist()
-                tbs[:3] = trans
-                self.imu_T_BS = pp.SE3(torch.tensor(tbs, dtype=torch.float64).reshape(1, 7))
-                Logger.write("info", f"imu_T_BS translation from {trans_source}: {trans}")
-        elif imu_calib is not None and "imu_camera_extrinsic" in imu_calib:
-            ext = imu_calib["imu_camera_extrinsic"]
-            trans = ext.get("translation_body_nwu_m", None)
-            if trans and len(trans) == 3:
-                tbs = self.imu_T_BS.tensor().reshape(-1).tolist()
-                tbs[:3] = trans
-                self.imu_T_BS = pp.SE3(torch.tensor(tbs, dtype=torch.float64).reshape(1, 7))
-                Logger.write("info", f"imu_T_BS translation from calib: {trans}")
+        self.imu_vio_sensor_T_imu = _load_t_ci(imu_extrinsic)
+        Logger.write(
+            "info",
+            "Loaded metadata.extrinsics.T_CI with contract p_C = T_CI p_I "
+            "(raw IMU FLU frame I to MACVO camera frame C)",
+        )
 
         self.frame_timestamps = self.image_l.timestamps
-        metadata_time_offset_ns = None
-        if meta:
-            ts_meta = meta.get("time_synchronization", {})
-            for key in ("camera_imu_time_offset_ns", "imu_time_offset_ns"):
-                if key in ts_meta:
-                    metadata_time_offset_ns = int(ts_meta[key])
-                    self.imu_time_offset_source = f"metadata.time_synchronization.{key}"
-                    break
 
         # ── IMU data: prefer imu_data.csv, fallback to imu.csv ──────────
         imu_csv_path = Path(self.seq_root, "imu_data.csv")
@@ -364,52 +249,28 @@ class GeneralStereoIMUSequence(SequenceBase[StereoInertialFrame]):
                 raise FileNotFoundError(f"Neither imu_data.csv nor imu.csv found in {self.seq_root}")
         self.imu_loader = IMUCSVLoader(imu_csv_path)
 
-        if metadata_time_offset_ns is not None:
-            self.imu_time_offset_ns = metadata_time_offset_ns
-        elif self.auto_estimate_time_offset:
-            # Only infer an offset when metadata does not provide one. Camera and
-            # IMU streams can have different final timestamps solely because of
-            # different sampling rates, which would create a false endpoint offset.
-            cam_first, cam_last = self.frame_timestamps[0], self.frame_timestamps[-1]
-            imu_first = int(self.imu_loader.time_ns[0].item())
-            imu_last = int(self.imu_loader.time_ns[-1].item())
-
-            offset_head = cam_first - imu_first
-            offset_tail = cam_last - imu_last
-            self.imu_time_offset_ns = int((offset_head + offset_tail) // 2)
-            self.imu_time_offset_source = "auto_endpoint_average"
-
         # ── Metadata usage summary ────────────────────────────────────
         _log_metadata_usage(self.seq_root, meta, cam_meta, imu_calib, imu_extrinsic)
 
         Logger.write(
             "info",
-            (
-                "GeneralStereoIMU time offset (camera_ns - imu_ns) = "
-                f"{self.imu_time_offset_ns} ns, "
-                f"auto_estimate={self.auto_estimate_time_offset}, "
-                f"source={self.imu_time_offset_source}, "
-                f"fallback_max_dt_ns={self.imu_fallback_max_dt_ns}"
-            ),
+            "GeneralStereoIMU timing contract: timestamps are nanoseconds and "
+            "camera/IMU offset is fixed to zero",
         )
 
         super().__init__(len(self.image_l))
 
     def __getitem__(self, local_index: int) -> StereoInertialFrame:
         index = self.get_index(local_index)
-        frame_ns_cam = self.frame_timestamps[index]
-        prev_ns_cam = self.frame_timestamps[index - 1] if index > 0 else (frame_ns_cam - self.imu_window_ns)
-
-        frame_ns_imu = frame_ns_cam - self.imu_time_offset_ns
-        prev_ns_imu = prev_ns_cam - self.imu_time_offset_ns
+        frame_ns = self.frame_timestamps[index]
+        prev_ns = self.frame_timestamps[index - 1] if index > 0 else (frame_ns - self.imu_window_ns)
 
         imu_time_ns, imu_acc, imu_gyro, imu_sampling_map = (
-            self.imu_loader.query_range_with_sampling_map(prev_ns_imu, frame_ns_imu)
+            self.imu_loader.query_range_with_sampling_map(prev_ns, frame_ns)
         )
         if imu_time_ns.numel() == 0:
-            _, nearest_time_ns, nearest_acc, nearest_gyro = self.imu_loader.query_nearest(frame_ns_imu)
-            aligned_nearest_time_ns = int(nearest_time_ns[0].item()) + self.imu_time_offset_ns
-            dt_ns = abs(aligned_nearest_time_ns - frame_ns_cam)
+            _, nearest_time_ns, nearest_acc, nearest_gyro = self.imu_loader.query_nearest(frame_ns)
+            dt_ns = abs(int(nearest_time_ns[0].item()) - frame_ns)
 
             use_nearest = (self.imu_fallback_max_dt_ns < 0) or (dt_ns <= self.imu_fallback_max_dt_ns)
             if use_nearest:
@@ -425,14 +286,14 @@ class GeneralStereoIMUSequence(SequenceBase[StereoInertialFrame]):
 
         frame = StereoInertialFrame(
             idx=[local_index],
-            time_ns=[frame_ns_cam],
+            time_ns=[frame_ns],
             stereo=StereoData(
                 T_BS=self.cam_T_BS,
                 K=self.K,
                 baseline=torch.tensor([self.baseline], dtype=torch.float32),
                 width=image_l.size(-1),
                 height=image_l.size(-2),
-                time_ns=[frame_ns_cam],
+                time_ns=[frame_ns],
                 imageL=image_l,
                 imageR=image_r,
             ),
@@ -448,30 +309,21 @@ class GeneralStereoIMUSequence(SequenceBase[StereoInertialFrame]):
         if self.imu_calib_acc_sigma is not None:
             frame.imu_calib_acc_sigma = self.imu_calib_acc_sigma
             frame.imu_calib_gyro_sigma = self.imu_calib_gyro_sigma
-            frame.imu_calib_sigma_unit = self.imu_calib_sigma_unit
             frame.imu_calib_source = self.imu_calib_source
-            frame.imu_calib_measurement_rate_hz = self.imu_calib_measurement_rate_hz
         if imu_sampling_map is not None:
             frame.imu_sampling_raw_time_ns = imu_sampling_map.raw_time_ns
             frame.imu_sampling_knot_from_raw = imu_sampling_map.knot_from_raw
         if self.imu_calib_acc_w_sigma is not None:
             frame.imu_calib_acc_w_sigma = self.imu_calib_acc_w_sigma
             frame.imu_calib_gyro_w_sigma = self.imu_calib_gyro_w_sigma
-            frame.imu_calib_bias_random_walk_update_hz = self.imu_calib_bias_random_walk_update_hz
         frame.imu_source_world_frame = self.imu_source_world_frame
         frame.imu_source_measurement_frame = self.imu_source_measurement_frame
         frame.imu_internal_world_frame = self.imu_internal_world_frame
         frame.imu_internal_measurement_frame = self.imu_internal_measurement_frame
         frame.imu_world_frame = self.imu_world_frame
         frame.imu_measurement_frame = self.imu_measurement_frame
-        frame.imu_acc_unit = self.imu_acc_unit
-        frame.imu_gyro_unit = self.imu_gyro_unit
-        frame.imu_timestamp_unit = self.imu_timestamp_unit
-        frame.imu_time_offset_ns = self.imu_time_offset_ns
-        frame.imu_time_offset_source = self.imu_time_offset_source
         frame.imu_metadata_gravity_m_s2 = self.imu_metadata_gravity_m_s2
         frame.imu_gravity_source = self.gravity_source
-        frame.imu_acc_includes_gravity = self.imu_acc_includes_gravity
         frame.imu_vio_sensor_T_imu = self.imu_vio_sensor_T_imu
 
         return frame
@@ -507,8 +359,6 @@ class GeneralStereoIMUSequence(SequenceBase[StereoInertialFrame]):
         optional_spec = {
             "imu_window_ns": lambda v: isinstance(v, int) and v > 0,
             "imu_fallback_max_dt_ns": lambda v: isinstance(v, int) and v >= -1,
-            "auto_estimate_time_offset": lambda v: isinstance(v, bool),
-            "imu_time_offset_ns": lambda v: isinstance(v, int),
             "camera": _camera_valid,
         }
         for key, test_fn in optional_spec.items():
@@ -532,67 +382,34 @@ def _log_metadata_usage(seq_root, meta, cam_meta, imu_calib, imu_extrinsic):
 
     if imu_calib:
         src = "metadata.json" if meta and "imu" in meta else "imu_calibration.yaml fallback"
-        sigma_unit = imu_calib.get("sigma_unit", "legacy_sqrt_rate_scaled")
-        lines.append(f"  imu noise: σ_a={imu_calib.get('AccelSigma')}, "
-                      f"σ_g={imu_calib.get('AngVelSigma')} "
-                      f"(sigma_unit={sigma_unit}, from {src})")
+        lines.append(f"  imu continuous densities: sigma_a={imu_calib.get('NoiseAcc')}, "
+                      f"sigma_g={imu_calib.get('NoiseGyro')}, "
+                      f"sigma_aw={imu_calib.get('AccWalk')}, "
+                      f"sigma_gw={imu_calib.get('GyroWalk')} (from {src})")
     else:
         lines.append("  imu noise: from config defaults (no calibration)")
 
     if imu_extrinsic:
-        t_ic = imu_extrinsic.get("T_imu_camera", {})
-        trans_ic = t_ic.get("translation_body_nwu_m", "N/A")
-        rot_ic = t_ic.get("rotation", "N/A")
-        lines.append(f"  camera extrinsic: T_imu_camera translation={trans_ic}, rotation={rot_ic}")
-        if meta and _metadata_uses_holoocean_nwu_flu(meta):
-            t_bi = imu_extrinsic.get("T_body_imu", {})
-            trans_bi = t_bi.get("translation_body_nwu_m", None)
-            t_bc = imu_extrinsic.get("T_body_camera", {})
-            trans_bc = t_bc.get("translation_body_nwu_m", None)
-            if trans_bi and len(trans_bi) == 3:
-                trans_internal = _body_nwu_translation_to_internal_ned(trans_bi)
-                lines.append(
-                    "  imu_T_BS: T_body_imu "
-                    f"body_NWU={trans_bi} -> internal NED={trans_internal}, "
-                    "rotation=R_x(180°)"
-                )
-                if trans_bc and len(trans_bc) == 3:
-                    camera_imu_nwu = [float(trans_bi[i]) - float(trans_bc[i]) for i in range(3)]
-                    camera_imu_internal = _body_nwu_translation_to_internal_ned(camera_imu_nwu)
-                    lines.append(
-                        "  imu_vio_sensor_T_imu: T_body_imu - T_body_camera "
-                        f"camera_NWU={camera_imu_nwu} -> internal NED={camera_imu_internal}"
-                    )
-            else:
-                lines.append("  imu_T_BS: T_body_imu missing, using T_imu_camera fallback")
+        lines.append("  extrinsic: sole 4x4 T_CI loaded with p_C = T_CI p_I")
+        lines.append(f"  T_CI={imu_extrinsic.get('T_CI', 'MISSING')}")
+        lines.append("  raw IMU samples: retained in frame I; T_CI is not applied during preintegration")
     else:
-        lines.append("  extrinsic: identity (no metadata)")
+        lines.append("  extrinsic: MISSING (metadata.extrinsics.T_CI is required)")
 
     if meta:
-        cc = meta.get("coordinate_convention", {})
         imu_meta = meta.get("imu", {})
         gt_meta = meta.get("ground_truth", {})
-        ts = meta.get("time_synchronization", {})
-        lines.append(f"  coord: world={cc.get('export_world_frame','?')}, "
-                     f"body={cc.get('body_frame','?')}, imu={cc.get('imu_measurement_frame', cc.get('imu_frame','?'))}")
-        lines.append(f"  imu meas: frame={imu_meta.get('frame','?')}, "
-                     f"acc_unit={imu_meta.get('acc_unit','?')}, "
-                     f"gyro_unit={imu_meta.get('gyro_unit','?')}, "
-                     f"acc_incl_g={imu_meta.get('acc_includes_gravity','?')}, "
-                     f"gravity={imu_meta.get('gravity_m_s2','?')}")
-        if _metadata_uses_holoocean_nwu_flu(meta):
-            lines.append("  IMU frame: source FLU/body-NWU converted to MACVO internal NED via R_x(180°)")
-        else:
-            lines.append("  FLU→NED: applied via imu_T_BS rotation R_x(180°)")
+        lines.append(f"  imu gravity magnitude={imu_meta.get('gravity_m_s2','?')}")
+        lines.append("  IMU samples: source FLU retained as optimizer/preintegration frame I")
+        lines.append("  world frame: internal NED; initial R_WI is supplied by static initialization/T_CI")
         lines.append(f"  GT quat: meaning={gt_meta.get('quaternion_meaning','?')}, "
                      f"order={gt_meta.get('quaternion_order','?')}")
         lines.append(f"  GT pos frame: {gt_meta.get('position_frame','?')}")
         lines.append(
             "  GT velocity frame: "
-            f"{gt_meta.get('velocity_frame', cc.get('ref_pose_velocity_frame','?'))}"
+            f"{gt_meta.get('velocity_frame', 'HoloOcean ref_pose world NWU') }"
         )
-        lines.append(f"  timestamp unit: {ts.get('timestamp_unit','?')}, "
-                     f"camera_imu_offset_ns={ts.get('camera_imu_time_offset_ns','?')}")
+        lines.append("  timing: nanosecond timestamps, fixed zero camera/IMU offset (runtime contract)")
 
     for line in lines:
         Logger.write("info", line)

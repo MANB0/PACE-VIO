@@ -15,7 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from Utility.PoseFrame import convert_pose_frame
+from Utility.PoseFrame import convert_pose_world_frame_only
 from Utility.T2HistorySmoother import (
     compressed_factor_equivalence,
     load_t2_history_archive,
@@ -43,7 +43,7 @@ def write_states(
     arrays: dict[str, np.ndarray],
 ) -> None:
     pose_internal = arrays["pose_WB_internal_ned"]
-    pose_nwu = convert_pose_frame(pose_internal, "NED", "NWU")
+    pose_nwu = convert_pose_world_frame_only(pose_internal, "NED", "NWU")
     velocity_internal = arrays["velocity_W_internal_ned"]
     velocity_nwu = velocity_internal.copy()
     velocity_nwu[:, 1:3] *= -1.0

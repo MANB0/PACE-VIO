@@ -18,14 +18,13 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from Scripts.evaluate_t2_history_smoother import (  # noqa: E402
-    FLU_TO_NED,
     evaluate_method,
     interpolate_rows,
     load_estimate,
     navigation_states,
     select_truth,
 )
-from Utility.PoseFrame import convert_pose_frame  # noqa: E402
+from Utility.PoseFrame import convert_pose_world_frame_only  # noqa: E402
 from Utility.T2HistorySmoother import (  # noqa: E402
     factor_cost_breakdown,
     load_t2_history_archive,
@@ -61,7 +60,7 @@ def convert_isam2_states(path: Path) -> pd.DataFrame:
     pose_internal = source[
         ["tx", "ty", "tz", "qx", "qy", "qz", "qw"]
     ].to_numpy(np.float64)
-    pose_nwu = convert_pose_frame(pose_internal, "NED", "NWU")
+    pose_nwu = convert_pose_world_frame_only(pose_internal, "NED", "NWU")
     velocity_nwu = source[["vx", "vy", "vz"]].to_numpy(np.float64)
     velocity_nwu[:, 1:3] *= -1.0
     return pd.DataFrame(
@@ -210,13 +209,13 @@ def main() -> None:
         timestamps,
         "timestamp",
         ["acc_bias_x", "acc_bias_y", "acc_bias_z"],
-    ) @ FLU_TO_NED.T
+    )
     gyro_bias_truth = interpolate_rows(
         args.bias_truth,
         timestamps,
         "timestamp",
         ["gyro_bias_x", "gyro_bias_y", "gyro_bias_z"],
-    ) @ FLU_TO_NED.T
+    )
 
     estimates = {
         "Online T2": online,
