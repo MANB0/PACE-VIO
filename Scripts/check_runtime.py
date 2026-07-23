@@ -36,7 +36,18 @@ def main() -> int:
         raise RuntimeError(f"Python >=3.10 is required, got {platform.python_version()}")
 
     versions: dict[str, str] = {"python": platform.python_version()}
-    for name in ("torch", "pypose", "cv2", "yaml", "numpy", "scipy", "timm", "einops"):
+    for name in (
+        "torch",
+        "pypose",
+        "cv2",
+        "yaml",
+        "numpy",
+        "scipy",
+        "timm",
+        "einops",
+        "jaxtyping",
+        "typeguard",
+    ):
         module = importlib.import_module(name)
         versions[name] = str(getattr(module, "__version__", "installed"))
 

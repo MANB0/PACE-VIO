@@ -7,6 +7,8 @@ tqdm
 rich
 cupy-cuda12x
 einops
+jaxtyping==0.3.7
+typeguard==4.5.1
 timm==0.9.12
 rerun-sdk==0.21.0
 yacs
