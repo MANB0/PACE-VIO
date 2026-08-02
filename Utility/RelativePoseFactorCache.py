@@ -43,28 +43,50 @@ def _skew(points: torch.Tensor) -> torch.Tensor:
     ).reshape(points.shape[:-1] + (3, 3))
 
 
-def relative_pose_information_from_packet(
-    packet: VisualFactorPacket,
+def relative_pose_information_from_correspondences(
+    points_Ci: torch.Tensor,
+    points_Cj: torch.Tensor,
+    covariance_Ci: torch.Tensor,
+    covariance_Cj: torch.Tensor,
     measurement_CiCj: torch.Tensor,
     *,
     huber_delta: float = 3.0,
     covariance_eigenvalue_floor: float = 1.0e-12,
     information_eigenvalue_floor: float = 1.0e-12,
 ) -> tuple[torch.Tensor, dict[str, float | int]]:
-    """Compress cached two-sided 3D measurements into a 6x6 pose covariance."""
+    """Build the Pose-factor covariance from paired camera-frame 3D points."""
 
     dtype = torch.float64
     pose = pp.SE3(measurement_CiCj.reshape(1, 7).to(dtype=dtype, device="cpu"))
-    points_i = packet.points_local.detach().to(device="cpu", dtype=dtype).reshape(-1, 3)
-    points_j = pixel2point_NED(
-        packet.match_fields["pixel2_uv"].detach().to(device="cpu", dtype=dtype).unsqueeze(0),
-        packet.match_fields["pixel2_d"].detach().to(device="cpu", dtype=dtype).reshape(1, -1),
-        packet.K.detach().to(device="cpu", dtype=dtype),
-    ).squeeze(0).reshape(-1, 3)
-    covariance_i = packet.match_fields["obs1_covTc"].detach().to(device="cpu", dtype=dtype)
-    covariance_j = packet.match_fields["obs2_covTc"].detach().to(device="cpu", dtype=dtype)
-    if points_i.shape != points_j.shape or points_i.shape[0] < 3:
-        raise VisualFactorCacheError("relative pose covariance requires at least three paired 3D points")
+    points_i = points_Ci.detach().to(device="cpu", dtype=dtype).reshape(-1, 3)
+    points_j = points_Cj.detach().to(device="cpu", dtype=dtype).reshape(-1, 3)
+    covariance_i = covariance_Ci.detach().to(
+        device="cpu", dtype=dtype
+    ).reshape(-1, 3, 3)
+    covariance_j = covariance_Cj.detach().to(
+        device="cpu", dtype=dtype
+    ).reshape(-1, 3, 3)
+    count = int(points_i.shape[0])
+    if count < 3 or points_j.shape != points_i.shape:
+        raise VisualFactorCacheError(
+            "relative pose covariance requires at least three paired 3D points"
+        )
+    if int(covariance_i.shape[0]) != count or int(covariance_j.shape[0]) != count:
+        raise VisualFactorCacheError(
+            "relative pose covariance rows must match paired 3D points"
+        )
+    finite = torch.cat(
+        [
+            points_i.reshape(-1),
+            points_j.reshape(-1),
+            covariance_i.reshape(-1),
+            covariance_j.reshape(-1),
+        ]
+    )
+    if not bool(torch.isfinite(finite).all()):
+        raise VisualFactorCacheError(
+            "relative pose covariance inputs contain NaN/Inf"
+        )
 
     rotation = pose.rotation().matrix().reshape(3, 3)
     translation = pose.translation().reshape(3)
@@ -118,15 +140,48 @@ def relative_pose_information_from_packet(
     ) * covariance_inflation
     covariance_pose = 0.5 * (covariance_pose + covariance_pose.mT)
     diagnostics: dict[str, float | int] = {
-        "num_points": int(points_i.shape[0]),
-        "num_inliers": int((norms <= delta).sum().item()),
-        "mean_mahalanobis_sq": float(whitened_residual.square().sum(dim=-1).mean().item()),
+        "num_points": count,
+        "num_inliers": int(inlier_mask.sum().item()),
+        "mean_mahalanobis_sq": float(
+            whitened_residual.square().sum(dim=-1).mean().item()
+        ),
         "inlier_mean_mahalanobis_sq": float(inlier_mean_mahalanobis_sq.item()),
         "covariance_inflation": float(covariance_inflation),
         "information_min_eigenvalue": float(info_values.min().item()),
         "information_max_eigenvalue": float(info_values.max().item()),
     }
     return covariance_pose, diagnostics
+
+
+def relative_pose_information_from_packet(
+    packet: VisualFactorPacket,
+    measurement_CiCj: torch.Tensor,
+    *,
+    huber_delta: float = 3.0,
+    covariance_eigenvalue_floor: float = 1.0e-12,
+    information_eigenvalue_floor: float = 1.0e-12,
+) -> tuple[torch.Tensor, dict[str, float | int]]:
+    """Compress cached two-sided 3D measurements into a 6x6 pose covariance."""
+
+    dtype = torch.float64
+    points_i = packet.points_local.detach().to(device="cpu", dtype=dtype).reshape(-1, 3)
+    points_j = pixel2point_NED(
+        packet.match_fields["pixel2_uv"].detach().to(device="cpu", dtype=dtype).unsqueeze(0),
+        packet.match_fields["pixel2_d"].detach().to(device="cpu", dtype=dtype).reshape(1, -1),
+        packet.K.detach().to(device="cpu", dtype=dtype),
+    ).squeeze(0).reshape(-1, 3)
+    covariance_i = packet.match_fields["obs1_covTc"].detach().to(device="cpu", dtype=dtype)
+    covariance_j = packet.match_fields["obs2_covTc"].detach().to(device="cpu", dtype=dtype)
+    return relative_pose_information_from_correspondences(
+        points_i,
+        points_j,
+        covariance_i,
+        covariance_j,
+        measurement_CiCj,
+        huber_delta=huber_delta,
+        covariance_eigenvalue_floor=covariance_eigenvalue_floor,
+        information_eigenvalue_floor=information_eigenvalue_floor,
+    )
 
 
 def camera_factor_to_body_factor(

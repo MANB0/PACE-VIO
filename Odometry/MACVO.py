@@ -61,7 +61,10 @@ from Utility.VisualFactorCache import (
     VisualFactorCacheError,
     VisualFactorCacheReader,
 )
-from Utility.RelativePoseFactorCache import RelativePoseFactorCacheReader
+from Utility.RelativePoseFactorCache import (
+    RelativePoseFactorCacheReader,
+    relative_pose_information_from_correspondences,
+)
 from Utility.CompressedUVDFactorCache import CompressedUVDFactorCacheReader
 from Utility.VisualInputFingerprint import visual_input_sha256
 from Utility.TwoStateVIO import (
@@ -340,15 +343,6 @@ class MACVO(IOdometry[T_SensorFrame], ConfigTestable):
         two_state_warm_start = str(
             getattr(self.Optimizer.config, "two_state_warm_start", "macvo_pose")
         ).strip().lower()
-        if (
-            optimizer_mode == "two_state_fixed_lag"
-            and self._visual_cache_reader is None
-            and two_state_visual_mode != "compressed_uvd"
-        ):
-            raise ValueError(
-                "online two_state_fixed_lag requires two_state_visual_factor_mode='compressed_uvd'; "
-                "relative_pose/direct_uvd currently require visual replay inputs"
-            )
         needs_relative_pose_sidecar = (
             two_state_visual_mode == "relative_pose"
             or (
@@ -650,6 +644,16 @@ class MACVO(IOdometry[T_SensorFrame], ConfigTestable):
         same visual optimum is also the local UVD compression point and pose
         warm-start; it is not added as a second pose measurement.
         """
+        visual_mode = str(getattr(
+            self.Optimizer.config,
+            "two_state_visual_factor_mode",
+            "relative_pose",
+        )).strip().lower()
+        optimizer_mode = str(getattr(
+            self.Optimizer.config,
+            "imu_factor_mode",
+            "",
+        )).strip().lower()
         points_Ci = graph_data.points.data.get("pos_Tc")
         target_uv = graph_data.observations.data.get("pixel2_uv")
         target_disparity = graph_data.observations.data.get("pixel2_disp")
@@ -668,6 +672,22 @@ class MACVO(IOdometry[T_SensorFrame], ConfigTestable):
                 "reason": "missing_online_uvd_fields",
             }
             return
+        if visual_mode == "relative_pose":
+            pose_fields = {
+                "pixel2_d": graph_data.observations.data.get("pixel2_d"),
+                "obs1_covTc": graph_data.observations.data.get("obs1_covTc"),
+                "obs2_covTc": graph_data.observations.data.get("obs2_covTc"),
+            }
+            missing_pose_fields = [
+                name for name, value in pose_fields.items() if value is None
+            ]
+            if missing_pose_fields:
+                self._live_macvo_raw_last_diagnostics = {
+                    "available": False,
+                    "reason": "missing_online_pose_fields",
+                    "missing": missing_pose_fields,
+                }
+                return
 
         # The UVD whitening path intentionally evaluates the normal equations
         # in float64.  Promote the observations here as well so the residual
@@ -730,16 +750,23 @@ class MACVO(IOdometry[T_SensorFrame], ConfigTestable):
                 )),
                 damping=1.0e-6,
             )
-            visual_mode = str(getattr(
-                self.Optimizer.config,
-                "two_state_visual_factor_mode",
-                "relative_pose",
-            )).strip().lower()
-            optimizer_mode = str(getattr(
-                self.Optimizer.config,
-                "imu_factor_mode",
-                "",
-            )).strip().lower()
+            if (
+                optimizer_mode == "two_state_fixed_lag"
+                and visual_mode in {"relative_pose", "direct_uvd", "compressed_uvd"}
+                and str(getattr(
+                    self.Optimizer.config,
+                    "two_state_warm_start",
+                    "macvo_pose",
+                )).strip().lower() == "macvo_pose"
+            ):
+                relative_for_graph = relative_CjCi.to(
+                    device=graph_data.from_pose.device,
+                    dtype=graph_data.from_pose.dtype,
+                )
+                graph_data.init_motion = (
+                    pp.SE3(graph_data.from_pose)
+                    @ pp.SE3(relative_for_graph).Inv()
+                )
             if (
                 optimizer_mode == "two_state_fixed_lag"
                 and visual_mode == "compressed_uvd"
@@ -778,20 +805,61 @@ class MACVO(IOdometry[T_SensorFrame], ConfigTestable):
                 graph_data.visual_compressed_uvd_huber_delta = float(
                     visual.huber_delta
                 )
-                if str(getattr(
-                    self.Optimizer.config,
-                    "two_state_warm_start",
-                    "macvo_pose",
-                )).strip().lower() == "macvo_pose":
-                    relative_for_graph = relative_CjCi.to(
-                        device=graph_data.from_pose.device,
-                        dtype=graph_data.from_pose.dtype,
-                    )
-                    graph_data.init_motion = (
-                        pp.SE3(graph_data.from_pose)
-                        @ pp.SE3(relative_for_graph).Inv()
-                    )
                 diagnostics["pace_compression_source"] = "online_visual_optimum"
+            elif (
+                optimizer_mode == "two_state_fixed_lag"
+                and visual_mode == "relative_pose"
+            ):
+                measurement_CiCj = pp.SE3(relative_CjCi).Inv().tensor()
+                points_Cj = pixel2point_NED(
+                    target_uv.unsqueeze(0),
+                    pose_fields["pixel2_d"].reshape(1, -1).to(points_Ci),
+                    graph_data.images_intrinsic.to(points_Ci),
+                ).squeeze(0)
+                pose_covariance, pose_diagnostics = (
+                    relative_pose_information_from_correspondences(
+                        points_Ci,
+                        points_Cj,
+                        pose_fields["obs1_covTc"],
+                        pose_fields["obs2_covTc"],
+                        measurement_CiCj,
+                        huber_delta=float(getattr(
+                            self.Optimizer.config,
+                            "two_state_visual_huber_delta",
+                            3.0,
+                        )),
+                        covariance_eigenvalue_floor=float(getattr(
+                            self.Optimizer.config,
+                            "two_state_covariance_eigenvalue_floor",
+                            1.0e-12,
+                        )),
+                    )
+                )
+                graph_data.visual_relative_pose_CiCj = (
+                    measurement_CiCj.detach().clone()
+                )
+                graph_data.visual_relative_pose_cov = (
+                    pose_covariance.detach().clone()
+                )
+                graph_data.visual_relative_pose_num_points = int(
+                    pose_diagnostics["num_points"]
+                )
+                graph_data.visual_relative_pose_num_inliers = int(
+                    pose_diagnostics["num_inliers"]
+                )
+                graph_data.visual_relative_pose_mean_mahalanobis_sq = float(
+                    pose_diagnostics["mean_mahalanobis_sq"]
+                )
+                diagnostics.update({
+                    f"pose_{name}": value
+                    for name, value in pose_diagnostics.items()
+                })
+                diagnostics["pose_factor_source"] = "online_visual_optimum"
+            elif (
+                optimizer_mode == "two_state_fixed_lag"
+                and visual_mode == "direct_uvd"
+            ):
+                diagnostics["uvd_factor_source"] = "online_point_residuals"
             from_idx = int(graph_data.from_idx.reshape(-1)[0].item())
             frame_idx = int(graph_data.frame_idx.reshape(-1)[0].item())
             previous_raw = self._live_macvo_raw_poses.get(from_idx)

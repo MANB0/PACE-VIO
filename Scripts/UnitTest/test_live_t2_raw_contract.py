@@ -1,3 +1,4 @@
+import copy
 from types import SimpleNamespace
 
 import pypose as pp
@@ -225,7 +226,7 @@ def test_dashboard_history_revision_replaces_committed_points_by_frame_index():
     assert "committed_history_revision" not in state
 
 
-def test_online_t2_compression_uses_visual_optimum_and_sets_warm_start():
+def test_online_visual_factor_modes_use_current_live_pair():
     torch.manual_seed(23)
     dtype = torch.float64
     points_Ci = torch.randn(120, 3, dtype=dtype)
@@ -251,9 +252,18 @@ def test_online_t2_compression_uses_visual_optimum_and_sets_warm_start():
         points=SimpleNamespace(data={"pos_Tc": points_Ci}),
         observations=SimpleNamespace(data={
             "pixel2_uv": target_uv,
+            "pixel2_d": points_Cj[:, 0:1],
             "pixel2_disp": target_disparity,
             "pixel2_uv_cov": uv_cov,
             "pixel2_disp_cov": disparity_cov,
+            "obs1_covTc": (
+                torch.eye(3, dtype=dtype).repeat(points_Ci.shape[0], 1, 1)
+                * 1.0e-3
+            ),
+            "obs2_covTc": (
+                torch.eye(3, dtype=dtype).repeat(points_Ci.shape[0], 1, 1)
+                * 1.0e-3
+            ),
         }),
         images_intrinsic=intrinsic,
         baseline=torch.tensor([baseline], dtype=dtype),
@@ -261,6 +271,11 @@ def test_online_t2_compression_uses_visual_optimum_and_sets_warm_start():
         frame_idx=torch.tensor([1]),
         from_pose=pp.SE3(graph_identity.clone()),
         init_motion=pp.SE3(graph_identity.clone()),
+        visual_relative_pose_CiCj=None,
+        visual_relative_pose_cov=None,
+        visual_relative_pose_num_points=0,
+        visual_relative_pose_num_inliers=0,
+        visual_relative_pose_mean_mahalanobis_sq=None,
         visual_compressed_uvd_reference_CjCi=None,
         visual_compressed_uvd_hessian=None,
         visual_compressed_uvd_gradient=None,
@@ -276,6 +291,8 @@ def test_online_t2_compression_uses_visual_optimum_and_sets_warm_start():
         two_state_visual_factor_mode="compressed_uvd",
         two_state_warm_start="macvo_pose",
         two_state_uvd_huber_delta=3.0,
+        two_state_visual_huber_delta=3.0,
+        two_state_covariance_eigenvalue_floor=1.0e-12,
         two_state_max_iterations=12,
         two_state_marginalization_eigenvalue_floor=1.0e-10,
     ))
@@ -283,6 +300,7 @@ def test_online_t2_compression_uses_visual_optimum_and_sets_warm_start():
     system._live_macvo_raw_last_diagnostics = {}
     system.graph = SimpleNamespace(frames=SimpleNamespace(data={"pose": graph_identity.clone()}))
 
+    base_graph_data = copy.deepcopy(graph_data)
     system._update_live_macvo_raw_pose(graph_data)
 
     reference_error = (
@@ -301,3 +319,39 @@ def test_online_t2_compression_uses_visual_optimum_and_sets_warm_start():
     assert graph_data.visual_compressed_uvd_gradient.shape == (6,)
     assert bool(torch.isfinite(graph_data.visual_compressed_uvd_hessian).all())
     assert graph_data.visual_compressed_uvd_num_points == points_Ci.shape[0]
+
+    pose_graph_data = copy.deepcopy(base_graph_data)
+    system.Optimizer.config.two_state_visual_factor_mode = "relative_pose"
+    system._update_live_macvo_raw_pose(pose_graph_data)
+    expected_CiCj = truth_CjCi.Inv()
+    pose_error = (
+        pp.SE3(pose_graph_data.visual_relative_pose_CiCj).Inv()
+        @ expected_CiCj
+    ).Log().tensor().reshape(6)
+    pose_covariance = pose_graph_data.visual_relative_pose_cov.reshape(6, 6)
+    pose_warm_start_error = (
+        pp.SE3(pose_graph_data.init_motion).Inv() @ expected_warm_start
+    ).Log().tensor().reshape(6)
+    assert system._live_macvo_raw_last_diagnostics["available"] is True
+    assert (
+        system._live_macvo_raw_last_diagnostics["pose_factor_source"]
+        == "online_visual_optimum"
+    )
+    assert float(pose_error.abs().max()) < 2.0e-5
+    assert float(pose_warm_start_error.abs().max()) < 2.0e-5
+    assert bool(torch.isfinite(pose_covariance).all())
+    assert float(torch.linalg.eigvalsh(pose_covariance).min()) >= -1.0e-12
+    assert pose_graph_data.visual_relative_pose_num_points == points_Ci.shape[0]
+
+    uvd_graph_data = copy.deepcopy(base_graph_data)
+    system.Optimizer.config.two_state_visual_factor_mode = "direct_uvd"
+    system._update_live_macvo_raw_pose(uvd_graph_data)
+    uvd_warm_start_error = (
+        pp.SE3(uvd_graph_data.init_motion).Inv() @ expected_warm_start
+    ).Log().tensor().reshape(6)
+    assert system._live_macvo_raw_last_diagnostics["available"] is True
+    assert (
+        system._live_macvo_raw_last_diagnostics["uvd_factor_source"]
+        == "online_point_residuals"
+    )
+    assert float(uvd_warm_start_error.abs().max()) < 2.0e-5

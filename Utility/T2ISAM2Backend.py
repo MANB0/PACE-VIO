@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import ctypes
 from dataclasses import dataclass
 import importlib
+import os
 from pathlib import Path
 import sys
 from typing import Any
@@ -12,11 +14,34 @@ from Utility.PACEFactorPacket import PACEFactorPacket
 from Utility.TwoStateVIO import NavigationState
 
 
+def _preload_project_local_gtsam(project_root: Path) -> None:
+    """Make a relocatable project-local GTSAM build visible to the extension."""
+    library_dir = project_root / ".deps" / "gtsam-install" / "lib"
+    if not library_dir.is_dir():
+        return
+
+    load_mode = getattr(ctypes, "RTLD_GLOBAL", getattr(os, "RTLD_GLOBAL", 0))
+    for library_name in (
+        "libmetis-gtsam.so",
+        "libcephes-gtsam.so.1",
+        "libgtsam.so.4",
+    ):
+        library_path = library_dir / library_name
+        if not library_path.exists():
+            continue
+        try:
+            ctypes.CDLL(str(library_path), mode=load_mode)
+        except OSError:
+            # The extension import below reports the complete missing dependency.
+            continue
+
+
 def _load_extension():
+    project_root = Path(__file__).resolve().parents[1]
+    _preload_project_local_gtsam(project_root)
     try:
         return importlib.import_module("pace_vio_isam2_backend")
     except ModuleNotFoundError as original_error:
-        project_root = Path(__file__).resolve().parents[1]
         module_dirs = (
             project_root / "build" / "pace_vio_isam2" / "python",
             project_root / "build" / "t2_isam2" / "python",
