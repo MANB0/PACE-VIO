@@ -1,15 +1,16 @@
 # Minimal release boundary
 
 This default branch is the sole maintained implementation and source of truth
-for the realtime MACVO T2 VIO project. Historical full-source branches and tags
+for the realtime PACE-VIO project. Historical full-source branches and tags
 are read-only audit and rollback material, not parallel implementations.
 
 Kept runtime surfaces:
 
 - live MACVO stereo frontend and uncertainty prediction;
-- online compressed-UVD T2 visual factor;
+- online PACE compressed-UVD visual factor as the production default, with
+  native Pose and point-level UVD factors retained for controlled comparison;
 - standard local-frame IMU preintegration with switchable two-state fixed-lag
-  and incremental iSAM2 backends consuming the same T2 factor packets;
+  and incremental iSAM2 backends consuming the same visual-inertial packets;
 - IMU-center coordinate conversion from dataset metadata;
 - realtime dashboard and replay controls;
 - generic stereo/IMU dataset loader;

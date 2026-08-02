@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Evaluate full-sequence T2-iSAM2 accuracy, smoothness, and timing growth."""
+"""Evaluate full-sequence PACE-VIO-iSAM2 accuracy, smoothness, and timing growth."""
 
 from __future__ import annotations
 
@@ -136,7 +136,7 @@ def write_plot(
             axis.axis("equal")
             axis.grid(alpha=0.25)
         axes[row, 0].legend(fontsize=8)
-    fig.suptitle("Full-sequence online T2 vs T2-iSAM2, IMU center")
+    fig.suptitle("Full-sequence PACE-VIO-2S vs PACE-VIO-iSAM2, IMU center")
     fig.savefig(output / "t2_isam2_full_three_scenes.png", dpi=180)
     plt.close(fig)
 
@@ -235,8 +235,8 @@ def main() -> None:
         analytic_points = analytic[["tx_nwu", "ty_nwu", "tz_nwu"]].to_numpy(np.float64)
         trajectories[scene] = {
             "GT": (gt_points - gt_points[0], "#111827"),
-            "Online T2": (online_points - online_points[0], "#dc2626"),
-            "T2-iSAM2": (analytic_points - analytic_points[0], "#059669"),
+            "Online PACE-VIO-2S": (online_points - online_points[0], "#dc2626"),
+            "PACE-VIO-iSAM2": (analytic_points - analytic_points[0], "#059669"),
         }
         analytic.to_csv(
             output / f"{scene}_t2_isam2_states_nwu_imu.csv",

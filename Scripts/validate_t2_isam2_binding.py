@@ -15,9 +15,9 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from Utility.T2FactorPacket import T2FactorPacket
+from Utility.PACEFactorPacket import PACEFactorPacket
 from Utility.T2HistorySmoother import load_t2_history_archive
-from Utility.T2ISAM2Backend import IncrementalT2ISAM2Backend
+from Utility.PACEISAM2Backend import IncrementalPACEISAM2Backend
 
 
 def parse_args() -> argparse.Namespace:
@@ -40,7 +40,7 @@ def main() -> None:
         end_frame=args.end_frame,
     )
     sigma = torch.diag(archive.initial_prior.sqrt_information).reciprocal()
-    backend = IncrementalT2ISAM2Backend(
+    backend = IncrementalPACEISAM2Backend(
         initial_prior_std={
             "pose_translation_std": float(sigma[0].item()),
             "pose_rotation_std": float(sigma[3].item()),
@@ -51,7 +51,7 @@ def main() -> None:
     )
     timing_rows = []
     for local_edge, edge in enumerate(archive.edges):
-        packet = T2FactorPacket.create(
+        packet = PACEFactorPacket.create(
             frame_i=edge.frame_i,
             frame_j=edge.frame_j,
             state_i_initial=archive.online_states[local_edge],

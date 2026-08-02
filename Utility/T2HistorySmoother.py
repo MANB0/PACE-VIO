@@ -1,9 +1,9 @@
-"""Offline full-history smoothing for archived T2 factors.
+"""Offline full-history smoothing for archived PACE factors.
 
 This module deliberately consumes the factors already written to ``tensor_map.npz``.
 It does not run MACVO, alter the online two-state estimator, or feed smoothed states
 back to the realtime path.  The residuals and local state convention are imported
-from :mod:`Utility.TwoStateVIO`, so the audit uses the production T2 mathematics.
+from :mod:`Utility.TwoStateVIO`, so the audit uses the production PACE mathematics.
 """
 
 from __future__ import annotations
@@ -96,7 +96,7 @@ def _sha256(path: Path) -> str:
 
 def _require(data: np.lib.npyio.NpzFile, name: str) -> np.ndarray:
     if name not in data.files:
-        raise KeyError(f"T2 tensor archive lacks {name!r}")
+        raise KeyError(f"PACE-VIO tensor archive lacks {name!r}")
     return np.asarray(data[name])
 
 
@@ -128,6 +128,7 @@ def load_t2_history_archive(
     acc_bias_std: float = 0.2,
     gyro_bias_std: float = 0.02,
     normal_eigenvalue_floor: float = 1.0e-10,
+    visual_normal_equations_path: str | Path | None = None,
 ) -> T2HistoryArchive:
     """Load an inclusive frame range from a production ``tensor_map.npz``."""
 
@@ -175,9 +176,24 @@ def load_t2_history_archive(
         bias_rw_cov = _require(data, "frames//imu_vio_bias_rw_cov")
         gravity = _require(data, "frames//imu_vio_gravity_world")
         gravity_in_residual = _require(data, "frames//imu_vio_gravity_in_residual")
-        visual_reference = _require(data, "frames//visual_compressed_uvd_reference_CjCi")
-        visual_hessian = _require(data, "frames//visual_compressed_uvd_hessian")
-        visual_gradient = _require(data, "frames//visual_compressed_uvd_gradient")
+        if visual_normal_equations_path is None:
+            visual_reference = _require(data, "frames//visual_compressed_uvd_reference_CjCi")
+            visual_hessian = _require(data, "frames//visual_compressed_uvd_hessian")
+            visual_gradient = _require(data, "frames//visual_compressed_uvd_gradient")
+        else:
+            visual_path = Path(visual_normal_equations_path).expanduser().resolve()
+            with np.load(visual_path, allow_pickle=False) as visual_data:
+                visual_timestamps = _require(visual_data, "timestamps_ns").astype(
+                    np.int64, copy=False
+                )
+                if visual_timestamps.shape[0] <= end_frame or not np.array_equal(
+                    visual_timestamps[start_frame : end_frame + 1],
+                    timestamps[start_frame : end_frame + 1],
+                ):
+                    raise ValueError("external UVD normal equations do not match frame timestamps")
+                visual_reference = _require(visual_data, "reference_CjCi").copy()
+                visual_hessian = _require(visual_data, "hessian").copy()
+                visual_gradient = _require(visual_data, "gradient").copy()
 
         edges: list[ArchivedT2Edge] = []
         for frame_j in range(start_frame + 1, end_frame + 1):

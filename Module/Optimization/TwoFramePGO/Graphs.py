@@ -269,6 +269,27 @@ class GraphOutput:
     isam2_initial_pose_mismatch_norm: float | None = None
     isam2_initial_velocity_mismatch_norm: float | None = None
     isam2_initial_bias_mismatch_norm: float | None = None
+    near_zero_velocity_enabled: bool = False
+    near_zero_velocity_detector_version: str = "disabled"
+    near_zero_velocity_candidate: bool = False
+    near_zero_velocity_active: bool = False
+    near_zero_velocity_entered: bool = False
+    near_zero_velocity_exited: bool = False
+    near_zero_velocity_estimated_speed_m_s: float | None = None
+    near_zero_velocity_imu_angular_rate_rad_s: float | None = None
+    near_zero_velocity_visual_angular_rate_rad_s: float | None = None
+    near_zero_velocity_visual_body_speed_m_s: float | None = None
+    near_zero_velocity_angular_rate_disagreement_rad_s: float | None = None
+    near_zero_velocity_rotation_vector_rate_difference_rad_s: float | None = None
+    near_zero_velocity_rotation_axis_cosine: float | None = None
+    near_zero_velocity_zero_translation_nis: float | None = None
+    near_zero_velocity_zero_translation_dof: int | None = None
+    near_zero_velocity_zero_translation_nis_per_dof: float | None = None
+    near_zero_velocity_zero_translation_position_residual_norm_m: float | None = None
+    near_zero_velocity_zero_translation_velocity_residual_norm_m_s: float | None = None
+    near_zero_velocity_reason: str = "disabled"
+    near_zero_velocity_prior_std_m_s: float | None = None
+    near_zero_velocity_prior_cost: float | None = None
     debug_trace: dict[str, T.Any] | None = None
 
 

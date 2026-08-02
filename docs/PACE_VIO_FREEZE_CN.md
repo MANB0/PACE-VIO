@@ -1,19 +1,19 @@
-# T2-iSAM2 minimal 冻结说明
+# PACE-VIO minimal 冻结说明
 
 ## 冻结范围
 
 本版本在 minimal 实时工程中加入可选的增量 iSAM2 求解器。iSAM2 与原
-two-state T2 共用同一个 `T2FactorPacket`，不会重新生成或重新加权测量：
+PACE-VIO 的 two-state 与 iSAM2 后端共用同一个 `PACEFactorPacket`，不会重新生成或重新加权测量：
 
 - 状态位姿：IMU 中心的 `T_WB`；
 - 状态切空间：`[p, phi, v, ba, bg]`；
 - IMU 残差与 covariance：`[p, v, R]`；
 - 视觉因子：压缩 UVD 的 `(T_ref, sqrt_information, residual_offset)`；
-- bias：与 T2 相同的 random-walk 因子；
+- bias：与 PACE-VIO-2S 相同的 random-walk 因子；
 - 坐标输出：IMU 中心、世界 NWU。
 
 `--vio-backend two_state` 保留原两状态求解器，`--vio-backend isam2`
-启用本版本。iSAM2 是 T2 因子的另一种增量求解方式，不是独立的 GTSAM
+启用本版本。iSAM2 是 PACE 因子的增量求解方式，不是独立的 GTSAM
 VIO 测量模型。
 
 ## 已验证内容
@@ -44,7 +44,7 @@ iSAM2 明显改善局部 RPE 和轨迹平滑度，但没有在每个场景都降
 
 ```bash
 export GTSAM_DIR=/absolute/path/to/lib/cmake/GTSAM  # 标准安装可省略
-bash Scripts/build_t2_isam2.sh
+bash Scripts/build_pace_vio_isam2.sh
 
 python -m pytest -q \
   Scripts/UnitTest/test_optimizer_finalize.py \
@@ -54,7 +54,7 @@ python -m pytest -q \
   Scripts/UnitTest/test_static_initialization_modes.py
 ```
 
-冻结前结果为 22 项 Python 测试全部通过，C++ `t2_isam2_factors` 测试通过。
+冻结前结果为 22 项 Python 测试全部通过，C++ 因子测试通过。
 
 ## 已知边界
 

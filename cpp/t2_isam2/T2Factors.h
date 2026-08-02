@@ -5,6 +5,8 @@
 #include <gtsam/base/numericalDerivative.h>
 #include <gtsam/geometry/Pose3.h>
 #include <gtsam/navigation/ImuBias.h>
+#include <gtsam/linear/LossFunctions.h>
+#include <gtsam/linear/NoiseModel.h>
 #include <gtsam/nonlinear/NoiseModelFactorN.h>
 
 #include <cmath>
@@ -50,10 +52,10 @@ class T2CompressedVisualFactor
     if (sqrt_information_tr_.cols() != 6 ||
         sqrt_information_tr_.rows() != residual_offset_.size() ||
         residual_offset_.size() < 1 || residual_offset_.size() > 6) {
-      throw std::invalid_argument("invalid compressed T2 visual factor shape");
+      throw std::invalid_argument("invalid compressed PACE visual factor shape");
     }
     if (!sqrt_information_tr_.allFinite() || !residual_offset_.allFinite()) {
-      throw std::invalid_argument("compressed T2 visual factor contains NaN/Inf");
+      throw std::invalid_argument("compressed PACE visual factor contains NaN/Inf");
     }
   }
 
@@ -104,6 +106,94 @@ class T2CompressedVisualFactor
   Pose3 extrinsic_CI_;
 };
 
+class T2DirectUVDPointFactor
+    : public gtsam::NoiseModelFactorN<Pose3, Pose3> {
+ public:
+  using Base = gtsam::NoiseModelFactorN<Pose3, Pose3>;
+  using Base::evaluateError;
+
+  T2DirectUVDPointFactor(
+      gtsam::Key pose_i_key, gtsam::Key pose_j_key,
+      const Point3& point_Ci, const Vector3& target_uvd,
+      const Eigen::Matrix3d& intrinsic, double baseline,
+      const Pose3& extrinsic_CI, const gtsam::SharedNoiseModel& noise_model)
+      : Base(noise_model, pose_i_key, pose_j_key),
+        point_Ci_(point_Ci),
+        target_uvd_(target_uvd),
+        intrinsic_(intrinsic),
+        baseline_(baseline),
+        extrinsic_CI_(extrinsic_CI) {
+    if (!point_Ci_.allFinite() || !target_uvd_.allFinite() ||
+        !intrinsic_.allFinite() || !(baseline_ > 0.0) ||
+        !std::isfinite(baseline_)) {
+      throw std::invalid_argument("direct UVD point factor contains invalid data");
+    }
+    if (!(intrinsic_(0, 0) > 0.0) || !(intrinsic_(1, 1) > 0.0)) {
+      throw std::invalid_argument("direct UVD point factor has invalid intrinsics");
+    }
+  }
+
+  Vector evaluateError(
+      const Pose3& pose_WI_i, const Pose3& pose_WI_j,
+      gtsam::OptionalMatrixType H_i = nullptr,
+      gtsam::OptionalMatrixType H_j = nullptr) const override {
+    Matrix6 H_WCi_WIi, H_WCj_WIj;
+    const Pose3 inverse_extrinsic = extrinsic_CI_.inverse();
+    const Pose3 pose_WC_i = pose_WI_i.compose(
+        inverse_extrinsic, (H_i || H_j) ? &H_WCi_WIi : nullptr);
+    const Pose3 pose_WC_j = pose_WI_j.compose(
+        inverse_extrinsic, (H_i || H_j) ? &H_WCj_WIj : nullptr);
+
+    Matrix6 H_current_WCj, H_current_WCi;
+    const Pose3 current_CjCi = pose_WC_j.between(
+        pose_WC_i,
+        (H_i || H_j) ? &H_current_WCj : nullptr,
+        (H_i || H_j) ? &H_current_WCi : nullptr);
+
+    Matrix H_point_current;
+    const Point3 point_Cj = current_CjCi.transformFrom(
+        point_Ci_, (H_i || H_j) ? &H_point_current : nullptr, nullptr);
+    const double depth = point_Cj.x();
+    if (!std::isfinite(depth) || std::abs(depth) < 1.0e-9) {
+      throw std::runtime_error("direct UVD projection reached zero camera depth");
+    }
+
+    const double fx = intrinsic_(0, 0);
+    const double fy = intrinsic_(1, 1);
+    const double cx = intrinsic_(0, 2);
+    const double cy = intrinsic_(1, 2);
+    Vector3 prediction;
+    prediction << fx * point_Cj.y() / depth + cx,
+        fy * point_Cj.z() / depth + cy,
+        fx * baseline_ / depth;
+
+    if (H_i || H_j) {
+      const double inverse_depth = 1.0 / depth;
+      const double inverse_depth_sq = inverse_depth * inverse_depth;
+      Eigen::Matrix3d H_projection = Eigen::Matrix3d::Zero();
+      H_projection(0, 0) = -fx * point_Cj.y() * inverse_depth_sq;
+      H_projection(0, 1) = fx * inverse_depth;
+      H_projection(1, 0) = -fy * point_Cj.z() * inverse_depth_sq;
+      H_projection(1, 2) = fy * inverse_depth;
+      H_projection(2, 0) = -fx * baseline_ * inverse_depth_sq;
+      if (H_i) {
+        *H_i = H_projection * H_point_current * H_current_WCi * H_WCi_WIi;
+      }
+      if (H_j) {
+        *H_j = H_projection * H_point_current * H_current_WCj * H_WCj_WIj;
+      }
+    }
+    return prediction - target_uvd_;
+  }
+
+ private:
+  Point3 point_Ci_;
+  Vector3 target_uvd_;
+  Eigen::Matrix3d intrinsic_;
+  double baseline_{};
+  Pose3 extrinsic_CI_;
+};
+
 class T2CachedImuFactor
     : public gtsam::NoiseModelFactorN<
           Pose3, Vector3, ConstantBias, Pose3, Vector3> {
@@ -137,10 +227,10 @@ class T2CachedImuFactor
         gravity_in_residual_(gravity_in_residual),
         derivative_epsilon_(derivative_epsilon) {
     if (!(dt_ > 0.0) || !std::isfinite(dt_)) {
-      throw std::invalid_argument("T2 cached IMU factor has invalid dt");
+      throw std::invalid_argument("PACE-VIO cached IMU factor has invalid dt");
     }
     if (!covariance_pvr.allFinite() || !bias_jacobian_.allFinite()) {
-      throw std::invalid_argument("T2 cached IMU factor contains NaN/Inf");
+      throw std::invalid_argument("PACE-VIO cached IMU factor contains NaN/Inf");
     }
   }
 

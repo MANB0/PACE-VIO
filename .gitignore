@@ -5,6 +5,7 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 build/
+.deps/
 
 # Local environments and editor state
 .venv/

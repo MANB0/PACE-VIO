@@ -1,13 +1,14 @@
-# Validated real-time T2 snapshot and rollback point
+# Validated real-time PACE-VIO snapshot and rollback point
 
-This private repository is a code-only release of the MACVO + IMU real-time
-T2-iSAM2 pipeline validated on 2026-07-23.
+This private repository is a code-only release of the PACE-VIO pipeline
+validated on 2026-07-23. `T2` is retained only in legacy compatibility paths
+and immutable historical result names.
 
 ## Included validated behavior
 
 - MACVO processes the real stereo frames before the VIO backend consumes the
   matching visual output and IMU interval.
-- The online T2 backend uses the compressed UVD visual factor and the standard
+- The online PACE-VIO backend uses the compressed UVD visual factor and the standard
   local-frame IMU preintegration path.
 - The optional iSAM2 backend consumes the same compressed UVD, local-frame IMU,
   and bias random-walk factor packets without first running the two-state
@@ -23,13 +24,13 @@ T2-iSAM2 pipeline validated on 2026-07-23.
 
 The minimal branch entry points are:
 
-- `Scripts/run_realtime_t2.py`
+- `Scripts/run_pace_vio.py`
 - `Scripts/check_runtime.py`
 - `Scripts/download_models.py`
 - `Utility/LiveDashboard.py`
 - `Utility/TwoStateVIO.py`
-- `Utility/T2ISAM2Backend.py`
-- `Utility/T2FactorPacket.py`
+- `Utility/PACEISAM2Backend.py`
+- `Utility/PACEFactorPacket.py`
 - `Utility/CompressedUVDFactorCache.py`
 
 The regression contracts are in `Scripts/UnitTest`, including live frontend
@@ -62,7 +63,7 @@ the real MACVO frontend, fixed three-second IMU initialization, and the iSAM2
 backend completed successfully on 2026-07-23. Its runtime contract reported:
 
 - `live MACVO stereo frontend (no visual cache)`
-- `isam2 + compressed_uvd T2 factor packets`
+- `isam2 + PACE compressed-UVD factor packets`
 - `standard_local_frame_preintegration`
 - `IMU center for VIO output`
 

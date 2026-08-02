@@ -95,20 +95,61 @@ T2BackendEdge EdgeFromDict(const py::dict& payload) {
   }
   edge.gravity_in_residual =
       payload["gravity_handling"].cast<std::string>() == "residual";
-  edge.visual_reference_CjCi = PoseFromXYZW(
-      payload["visual_reference_CjCi"].cast<gtsam::Vector>());
-  edge.visual_A = payload["visual_sqrt_information"].cast<gtsam::Matrix>();
-  edge.visual_c = payload["visual_residual_offset"].cast<gtsam::Vector>();
+  edge.visual_factor_mode =
+      payload["visual_factor_mode"].cast<std::string>();
+  if (edge.visual_factor_mode == "compressed_uvd") {
+    edge.visual_reference_CjCi = PoseFromXYZW(
+        payload["visual_reference_CjCi"].cast<gtsam::Vector>());
+    edge.visual_A =
+        payload["visual_sqrt_information"].cast<gtsam::Matrix>();
+    edge.visual_c =
+        payload["visual_residual_offset"].cast<gtsam::Vector>();
+  } else if (edge.visual_factor_mode == "relative_pose") {
+    edge.visual_measurement_BiBj = PoseFromXYZW(
+        payload["visual_measurement_BiBj"].cast<gtsam::Vector>());
+    edge.visual_covariance_tr =
+        payload["visual_covariance_tr"].cast<gtsam::Matrix6>();
+    edge.visual_huber_delta = payload["visual_huber_delta"].cast<double>();
+  } else if (edge.visual_factor_mode == "direct_uvd") {
+    edge.visual_points_Ci =
+        payload["visual_points_Ci"].cast<gtsam::Matrix>();
+    edge.visual_target_uvd =
+        payload["visual_target_uvd"].cast<gtsam::Matrix>();
+    edge.visual_covariance_uvd_flat =
+        payload["visual_covariance_uvd_flat"].cast<gtsam::Matrix>();
+    edge.visual_intrinsic =
+        payload["visual_intrinsic"].cast<Eigen::Matrix3d>();
+    edge.visual_baseline = payload["visual_baseline"].cast<double>();
+    edge.visual_huber_delta = payload["visual_huber_delta"].cast<double>();
+  } else {
+    throw std::invalid_argument(
+        "unsupported iSAM2 visual factor mode: " + edge.visual_factor_mode);
+  }
   edge.extrinsic_CI =
       PoseFromXYZW(payload["extrinsic_CI"].cast<gtsam::Vector>());
+  const bool has_velocity_prior_mean =
+      payload.contains("velocity_prior_mean_W");
+  const bool has_velocity_prior_covariance =
+      payload.contains("velocity_prior_covariance_W");
+  if (has_velocity_prior_mean != has_velocity_prior_covariance) {
+    throw std::invalid_argument(
+        "velocity prior requires both mean and covariance");
+  }
+  if (has_velocity_prior_mean) {
+    edge.velocity_prior_enabled = true;
+    edge.velocity_prior_mean_W =
+        payload["velocity_prior_mean_W"].cast<gtsam::Vector3>();
+    edge.velocity_prior_covariance =
+        payload["velocity_prior_covariance_W"].cast<Eigen::Matrix3d>();
+  }
   return edge;
 }
 
 }  // namespace
 
-PYBIND11_MODULE(t2_isam2_backend, module) {
-  module.doc() = "Incremental iSAM2 backend for T2 factor packets";
-  py::class_<T2ISAM2Backend>(module, "T2ISAM2Backend")
+PYBIND11_MODULE(pace_vio_isam2_backend, module) {
+  module.doc() = "Incremental iSAM2 backend for PACE-VIO factor packets";
+  py::class_<T2ISAM2Backend>(module, "PACEISAM2Backend")
       .def(
           py::init<double, int, double>(),
           py::arg("relinearize_threshold") = 0.01,
@@ -136,8 +177,10 @@ PYBIND11_MODULE(t2_isam2_backend, module) {
             result["imu_cost"] = update.imu_cost;
             result["bias_cost"] = update.bias_cost;
             result["visual_cost"] = update.visual_cost;
+            result["velocity_prior_cost"] = update.velocity_prior_cost;
             result["total_edge_cost"] =
-                update.imu_cost + update.bias_cost + update.visual_cost;
+                update.imu_cost + update.bias_cost + update.visual_cost +
+                update.velocity_prior_cost;
             result["initial_pose_mismatch_norm"] =
                 update.initial_pose_mismatch_norm;
             result["initial_velocity_mismatch_norm"] =
@@ -160,4 +203,5 @@ PYBIND11_MODULE(t2_isam2_backend, module) {
       .def_property_readonly("initialized", &T2ISAM2Backend::initialized)
       .def_property_readonly("latest_frame", &T2ISAM2Backend::latestFrame)
       .def_property_readonly("state_count", &T2ISAM2Backend::stateCount);
+  module.attr("T2ISAM2Backend") = module.attr("PACEISAM2Backend");
 }

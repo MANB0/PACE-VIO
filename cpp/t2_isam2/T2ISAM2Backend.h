@@ -16,6 +16,7 @@
 #include <limits>
 #include <memory>
 #include <stdexcept>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -63,10 +64,22 @@ struct T2BackendEdge {
       Eigen::Matrix<double, 6, 6>::Identity();
   Vector3 gravity_world = Vector3::Zero();
   bool gravity_in_residual{};
+  std::string visual_factor_mode = "compressed_uvd";
   Pose3 visual_reference_CjCi;
   Matrix visual_A;
   Vector visual_c;
+  Pose3 visual_measurement_BiBj;
+  Matrix6 visual_covariance_tr = Matrix6::Identity();
+  double visual_huber_delta = 1.0e12;
+  Matrix visual_points_Ci;
+  Matrix visual_target_uvd;
+  Matrix visual_covariance_uvd_flat;
+  Eigen::Matrix3d visual_intrinsic = Eigen::Matrix3d::Identity();
+  double visual_baseline{};
   Pose3 extrinsic_CI;
+  bool velocity_prior_enabled{};
+  Vector3 velocity_prior_mean_W = Vector3::Zero();
+  Eigen::Matrix3d velocity_prior_covariance = Eigen::Matrix3d::Identity();
 };
 
 struct T2BackendUpdate {
@@ -76,6 +89,7 @@ struct T2BackendUpdate {
   double imu_cost{};
   double bias_cost{};
   double visual_cost{};
+  double velocity_prior_cost{};
   double initial_pose_mismatch_norm{};
   double initial_velocity_mismatch_norm{};
   double initial_bias_mismatch_norm{};
@@ -110,7 +124,7 @@ class T2ISAM2Backend {
         covariance_floor_(covariance_floor) {
     if (!(relinearize_threshold_ > 0.0) || relinearize_skip_ < 1 ||
         !(covariance_floor_ > 0.0)) {
-      throw std::invalid_argument("invalid T2 iSAM2 backend configuration");
+      throw std::invalid_argument("invalid PACE-VIO-iSAM2 backend configuration");
     }
   }
 
@@ -120,7 +134,7 @@ class T2ISAM2Backend {
     if (prior_sigma_t2.size() != 15 ||
         !(prior_sigma_t2.array() > 0.0).all() ||
         !prior_sigma_t2.allFinite()) {
-      throw std::invalid_argument("T2 prior sigma must contain 15 positive values");
+      throw std::invalid_argument("PACE-VIO prior sigma must contain 15 positive values");
     }
     gtsam::ISAM2Params params;
     params.relinearizeThreshold = relinearize_threshold_;
@@ -163,19 +177,49 @@ class T2ISAM2Backend {
   T2BackendUpdate AddEdge(const T2BackendEdge& edge) {
     RequireInitialized();
     if (edge.frame_i != frames_.back() || edge.frame_j <= edge.frame_i) {
-      throw std::invalid_argument("T2 factor packet is not continuous with iSAM2 history");
+      throw std::invalid_argument("visual-inertial packet is not continuous with iSAM2 history");
     }
     if (!(edge.dt > 0.0) || !std::isfinite(edge.dt)) {
-      throw std::invalid_argument("T2 factor packet has invalid IMU dt");
+      throw std::invalid_argument("visual-inertial packet has invalid IMU dt");
     }
-    if (edge.visual_A.cols() != 6 || edge.visual_A.rows() < 1 ||
-        edge.visual_A.rows() > 6 || edge.visual_c.size() != edge.visual_A.rows()) {
-      throw std::invalid_argument("T2 factor packet has invalid compressed visual shape");
+    if (edge.visual_factor_mode == "compressed_uvd") {
+      if (edge.visual_A.cols() != 6 || edge.visual_A.rows() < 1 ||
+          edge.visual_A.rows() > 6 ||
+          edge.visual_c.size() != edge.visual_A.rows()) {
+        throw std::invalid_argument(
+            "visual-inertial packet has invalid compressed visual shape");
+      }
+    } else if (edge.visual_factor_mode == "relative_pose") {
+      if (!edge.visual_covariance_tr.allFinite() ||
+          !(edge.visual_huber_delta > 0.0) ||
+          !std::isfinite(edge.visual_huber_delta)) {
+        throw std::invalid_argument("Pose factor packet contains invalid data");
+      }
+    } else if (edge.visual_factor_mode == "direct_uvd") {
+      const auto count = edge.visual_points_Ci.rows();
+      if (count < 3 || edge.visual_points_Ci.cols() != 3 ||
+          edge.visual_target_uvd.rows() != count ||
+          edge.visual_target_uvd.cols() != 3 ||
+          edge.visual_covariance_uvd_flat.rows() != count ||
+          edge.visual_covariance_uvd_flat.cols() != 9 ||
+          !edge.visual_points_Ci.allFinite() ||
+          !edge.visual_target_uvd.allFinite() ||
+          !edge.visual_covariance_uvd_flat.allFinite() ||
+          !edge.visual_intrinsic.allFinite() ||
+          !(edge.visual_baseline > 0.0) ||
+          !std::isfinite(edge.visual_baseline) ||
+          !(edge.visual_huber_delta > 0.0) ||
+          !std::isfinite(edge.visual_huber_delta)) {
+        throw std::invalid_argument("direct UVD factor packet contains invalid data");
+      }
+    } else {
+      throw std::invalid_argument(
+          "unsupported iSAM2 visual factor mode: " + edge.visual_factor_mode);
     }
     const double extrinsic_error = Pose3::Logmap(
         extrinsic_CI_.between(edge.extrinsic_CI)).lpNorm<Eigen::Infinity>();
     if (extrinsic_error > 1.0e-10) {
-      throw std::invalid_argument("T2 factor packet changed T_CI during a run");
+      throw std::invalid_argument("visual-inertial packet changed T_CI during a run");
     }
 
     const int local_i = static_cast<int>(frames_.size()) - 1;
@@ -198,14 +242,67 @@ class T2ISAM2Backend {
     auto bias = std::make_shared<gtsam::BetweenFactor<ConstantBias>>(
         B(local_i), B(local_j), ConstantBias(),
         gtsam::noiseModel::Gaussian::Covariance(bias_covariance));
-    auto visual = std::make_shared<T2CompressedVisualFactor>(
-        X(local_i), X(local_j), edge.visual_reference_CjCi,
-        edge.visual_A, edge.visual_c, edge.extrinsic_CI);
+    std::vector<gtsam::NonlinearFactor::shared_ptr> visual_factors;
+    if (edge.visual_factor_mode == "compressed_uvd") {
+      visual_factors.push_back(std::make_shared<T2CompressedVisualFactor>(
+          X(local_i), X(local_j), edge.visual_reference_CjCi,
+          edge.visual_A, edge.visual_c, edge.extrinsic_CI));
+    } else if (edge.visual_factor_mode == "relative_pose") {
+      const Matrix6 permutation = TranslationRotationFromRotationTranslation();
+      const Matrix6 covariance_rt = StabilizeCovariance<6>(
+          permutation * edge.visual_covariance_tr * permutation.transpose(),
+          covariance_floor_);
+      const auto gaussian = gtsam::noiseModel::Gaussian::Covariance(covariance_rt);
+      const auto robust = gtsam::noiseModel::Robust::Create(
+          gtsam::noiseModel::mEstimator::Huber::Create(
+              edge.visual_huber_delta),
+          gaussian);
+      visual_factors.push_back(
+          std::make_shared<gtsam::BetweenFactor<Pose3>>(
+              X(local_i), X(local_j), edge.visual_measurement_BiBj, robust));
+    } else {
+      visual_factors.reserve(edge.visual_points_Ci.rows());
+      for (int point_index = 0;
+           point_index < edge.visual_points_Ci.rows(); ++point_index) {
+        Eigen::Matrix3d covariance;
+        for (int row = 0; row < 3; ++row) {
+          for (int column = 0; column < 3; ++column) {
+            covariance(row, column) = edge.visual_covariance_uvd_flat(
+                point_index, row * 3 + column);
+          }
+        }
+        covariance = StabilizeCovariance<3>(covariance, covariance_floor_);
+        const auto gaussian = gtsam::noiseModel::Gaussian::Covariance(covariance);
+        const auto robust = gtsam::noiseModel::Robust::Create(
+            gtsam::noiseModel::mEstimator::Huber::Create(
+                edge.visual_huber_delta),
+            gaussian);
+        visual_factors.push_back(std::make_shared<T2DirectUVDPointFactor>(
+            X(local_i), X(local_j),
+            edge.visual_points_Ci.row(point_index).transpose(),
+            edge.visual_target_uvd.row(point_index).transpose(),
+            edge.visual_intrinsic, edge.visual_baseline,
+            edge.extrinsic_CI, robust));
+      }
+    }
+    std::shared_ptr<gtsam::PriorFactor<Vector3>> velocity_prior;
 
     NonlinearFactorGraph factors;
     factors.push_back(imu);
     factors.push_back(bias);
-    factors.push_back(visual);
+    for (const auto& visual : visual_factors) {
+      factors.push_back(visual);
+    }
+    if (edge.velocity_prior_enabled) {
+      const Eigen::Matrix3d velocity_prior_covariance =
+          StabilizeCovariance<3>(
+              edge.velocity_prior_covariance, covariance_floor_);
+      velocity_prior = std::make_shared<gtsam::PriorFactor<Vector3>>(
+          V(local_j), edge.velocity_prior_mean_W,
+          gtsam::noiseModel::Gaussian::Covariance(
+              velocity_prior_covariance));
+      factors.push_back(velocity_prior);
+    }
     Values values;
     values.insert(X(local_j), edge.initial_j.pose_WB);
     values.insert(V(local_j), edge.initial_j.velocity_W);
@@ -224,7 +321,12 @@ class T2ISAM2Backend {
     result.update_ms = update_ms;
     result.imu_cost = imu->error(estimate);
     result.bias_cost = bias->error(estimate);
-    result.visual_cost = visual->error(estimate);
+    result.visual_cost = 0.0;
+    for (const auto& visual : visual_factors) {
+      result.visual_cost += visual->error(estimate);
+    }
+    result.velocity_prior_cost =
+        velocity_prior ? velocity_prior->error(estimate) : 0.0;
     result.initial_pose_mismatch_norm = Pose3::Logmap(
         previous_pose.between(edge.initial_i.pose_WB)).norm();
     result.initial_velocity_mismatch_norm =
@@ -260,7 +362,7 @@ class T2ISAM2Backend {
  private:
   void RequireInitialized() const {
     if (!initialized_ || !isam_) {
-      throw std::runtime_error("T2 iSAM2 backend is not initialized");
+      throw std::runtime_error("PACE-VIO-iSAM2 backend is not initialized");
     }
   }
 

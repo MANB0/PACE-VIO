@@ -146,9 +146,9 @@ function setMetrics(s){
   const rows=[['Frame',s.frame_idx],['Time',fmt((s.timestamp_ns||0)*1e-9,3)+' s'],['Static init',s.static_initialized?'done':'active'],['IMU samples',s.imu_recent?.length||s.static_sample_count||0],['Frontend',fmt(s.frontend_ms,1)+' ms'],['Backend',String(d.backend||'two_state')+' · '+fmt(s.backend_ms,1)+' ms'],['History revision',d.history_revision?('yes · '+(d.state_count??'')+' states'):('no · '+(d.state_count??'')+' states')],['Position',vec(p,3)]];
   $('metrics').innerHTML=rows.map(r=>'<div class="metric"><div class="k">'+r[0]+'</div><div class="v">'+r[1]+'</div></div>').join('');
   $('state').textContent='position  '+vec(c.position,5)+'\nvelocity  '+vec(c.velocity,5)+'\nacc bias  '+vec(c.acc_bias,6)+'\ngyro bias '+vec(c.gyro_bias,6)+'\nquaternion '+vec(c.orientation,6);
-  const rs=s.raw_solver||{}; $('diag').textContent='cost total '+fmt(d.cost_total,4)+'\npose cost  '+fmt(d.pose_cost,4)+'\nIMU cost   '+fmt(d.imu_cost,4)+'\np/v cost   '+fmt(d.bias_cost,4)+'\niterations '+(d.iterations??'—')+'\nbackend '+(d.backend||'two_state')+'\nupdate '+fmt(d.update_ms,3)+' ms\nvisual path '+(d.visual_action||'—')+'\ncompression '+(rs.t2_compression_source||'—')+'\nstatic ZUPT '+(s.static_zupt_active?'active':'inactive');
+  const rs=s.raw_solver||{}; $('diag').textContent='cost total '+fmt(d.cost_total,4)+'\npose cost  '+fmt(d.pose_cost,4)+'\nIMU cost   '+fmt(d.imu_cost,4)+'\np/v cost   '+fmt(d.bias_cost,4)+'\niterations '+(d.iterations??'—')+'\nbackend '+(d.backend||'two_state')+'\nupdate '+fmt(d.update_ms,3)+' ms\nvisual path '+(d.visual_action||'—')+'\ncompression '+(rs.pace_compression_source||rs.t2_compression_source||'—')+'\nstatic ZUPT '+(s.static_zupt_active?'active':'inactive');
   const ct=s.contract||{}; $('contract').textContent='world frame: '+(ct.world_frame||'NWU')+'\nreference: '+(ct.reference_point||'IMU origin')+'\norigin: '+(ct.origin||'first valid IMU pose')+'\npose source: '+(ct.pose_source||'T_WI = T_WC * T_CI');
-  $('meta').textContent=(s.meta?.project||'MACVO + VIO')+' · '+(s.meta?.scene||'scene')+' · '+(s.meta?.mode||'real pipeline');
+  $('meta').textContent=(s.meta?.project||'PACE-VIO')+' · '+(s.meta?.scene||'scene')+' · '+(s.meta?.mode||'real pipeline');
 }
 function project(p,mode){ if(mode==='XZ') return [p[0],p[2]]; if(mode==='YZ') return [p[1],p[2]]; return [p[0],p[1]]; }
 function drawArrow(ctx,a,b,color){ if(!a||!b) return; const dx=b[0]-a[0],dy=b[1]-a[1],l=Math.hypot(dx,dy)||1; const ux=dx/l,uy=dy/l; const h=10; ctx.strokeStyle=color;ctx.fillStyle=color;ctx.lineWidth=2.4;ctx.beginPath();ctx.moveTo(a[0],a[1]);ctx.lineTo(b[0],b[1]);ctx.stroke();ctx.beginPath();ctx.moveTo(b[0],b[1]);ctx.lineTo(b[0]-h*ux+h*.55*uy,b[1]-h*uy-h*.55*ux);ctx.lineTo(b[0]-h*ux-h*.55*uy,b[1]-h*uy+h*.55*ux);ctx.closePath();ctx.fill(); }
@@ -385,8 +385,8 @@ class LiveDashboard:
             "reference_point": "IMU center",
             "origin": "first valid IMU pose",
             "pose_source": "T_WI = T_WC * T_CI",
-            "raw_source": "independent visual-only UVD solve; no IMU/prior/T2 pose",
-            "committed_source": "T2 result after optimizer write-back",
+            "raw_source": "independent visual-only UVD solve; no IMU/prior/PACE-VIO pose",
+            "committed_source": "PACE-VIO result after optimizer write-back",
         }
 
     def _load_gt(self) -> None:
@@ -398,18 +398,50 @@ class LiveDashboard:
             return
         try:
             body_to_imu = np.zeros(3, dtype=np.float64)
+            gt_is_imu_center = False
             if metadata_path.exists():
                 meta = json.loads(metadata_path.read_text(encoding="utf-8"))
+                ground_truth = meta.get("ground_truth", {})
+                trajectory = meta.get("trajectory", {})
+                reference_point = str(
+                    ground_truth.get(
+                        "reference_point",
+                        trajectory.get("reference_point", ""),
+                    )
+                ).strip().lower().replace("_", "").replace(" ", "")
+                if reference_point in {
+                    "imu",
+                    "imucenter",
+                    "imuorigin",
+                    "imusocket",
+                }:
+                    gt_is_imu_center = True
+                elif reference_point not in {
+                    "",
+                    "body",
+                    "bodycenter",
+                    "bodyorigin",
+                    "cameraleft",
+                    "cameraleftsocket",
+                    "leftcamera",
+                    "leftcameracenter",
+                }:
+                    raise ValueError(
+                        "unsupported ground-truth reference point: "
+                        f"{reference_point!r}"
+                    )
                 matrix_CI = np.asarray(
                     meta.get("extrinsics", {}).get("T_CI"),
                     dtype=np.float64,
                 )
                 if matrix_CI.shape != (4, 4):
                     raise ValueError("metadata.extrinsics.T_CI must be 4x4")
-                # ref_pose orientation uses body FLU/NWU axes. T_CI translation
-                # is expressed in MACVO camera FRD/NED axes, hence D*t_CI.
-                ned_to_nwu = np.diag([1.0, -1.0, -1.0])
-                body_to_imu = ned_to_nwu @ matrix_CI[:3, 3]
+                if not gt_is_imu_center:
+                    # Legacy HoloOcean ref_pose files use the camera/body
+                    # reference point. T_CI translation is expressed in MACVO
+                    # camera FRD/NED axes, hence D*t_CI before the lever shift.
+                    ned_to_nwu = np.diag([1.0, -1.0, -1.0])
+                    body_to_imu = ned_to_nwu @ matrix_CI[:3, 3]
             rows = []
             with path.open("r", newline="", encoding="utf-8") as stream:
                 for row in csv.DictReader(stream):
@@ -428,7 +460,11 @@ class LiveDashboard:
                 q = np.asarray([row[2] for row in rows])
                 R = pp.SO3(__import__("torch").from_numpy(q)).matrix().cpu().numpy()
                 p = np.asarray([row[1] for row in rows])
-                p_imu = p + np.einsum("nij,nj->ni", R, np.broadcast_to(body_to_imu, p.shape))
+                p_imu = p + np.einsum(
+                    "nij,nj->ni",
+                    R,
+                    np.broadcast_to(body_to_imu, p.shape),
+                )
                 p_imu -= p_imu[0]
                 for row, position in zip(rows, p_imu):
                     self._gt[row[0]] = position.tolist()

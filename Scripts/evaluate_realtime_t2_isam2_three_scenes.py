@@ -181,7 +181,7 @@ def plot_trajectories(
             axis.axis("equal")
             axis.grid(alpha=0.25)
         axes[row, 0].legend(fontsize=8)
-    fig.suptitle("T2-iSAM2: cached-factor validation vs real MACVO frontend, IMU center")
+    fig.suptitle("PACE-VIO-iSAM2: cached-factor validation vs real MACVO frontend, IMU center")
     fig.savefig(output / "realtime_t2_isam2_three_scenes.png", dpi=180)
     plt.close(fig)
 

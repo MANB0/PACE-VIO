@@ -35,6 +35,12 @@ GT to the dashboard with columns:
 timestamp,x,y,z,qx,qy,qz,qw,vx,vy,vz,wx,wy,wz
 ```
 
+New datasets must record `ref_pose.csv` directly at the IMU origin and declare
+`metadata.ground_truth.reference_point = "IMUSocket"`. The dashboard then uses
+the positions without an additional lever-arm shift. Archived HoloOcean
+datasets that declare `trajectory.reference_point = "CameraLeftSocket"` remain
+supported and are converted once to the IMU origin for display.
+
 `metadata.extrinsics` contains exactly one 4x4 matrix, `T_CI`, with the strict
 contract `p_C = T_CI p_I`. `I` is the raw IMU CSV measurement frame and `C` is
 MACVO's internal camera frame (x-forward, y-right, z-down). Translation is the
@@ -62,3 +68,11 @@ initialization.
 For controlled ablation only, `--static-init-state-policy zero` keeps the
 detected fixed/adaptive boundary while discarding its estimated attitude and
 biases. The production default remains `estimated`.
+
+## Output trajectory reference
+
+For stereo-IMU runs, `poses.csv` is the canonical PACE-VIO trajectory and is
+reported at the IMU origin. `poses_imu.csv` is retained as an identical
+compatibility alias for archived evaluation scripts. The MACVO-map trajectory
+at the visual sensor origin is written separately as `poses_camera.csv`.
+`pose_reference_points.json` records these semantics in every result directory.

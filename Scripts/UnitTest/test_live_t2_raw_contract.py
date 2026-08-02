@@ -294,7 +294,7 @@ def test_online_t2_compression_uses_visual_optimum_and_sets_warm_start():
         pp.SE3(graph_data.init_motion).Inv() @ expected_warm_start
     ).Log().tensor().reshape(6)
     assert system._live_macvo_raw_last_diagnostics["available"] is True
-    assert system._live_macvo_raw_last_diagnostics["t2_compression_source"] == "online_visual_optimum"
+    assert system._live_macvo_raw_last_diagnostics["pace_compression_source"] == "online_visual_optimum"
     assert float(reference_error.abs().max()) < 2.0e-5
     assert float(warm_start_error.abs().max()) < 2.0e-5
     assert graph_data.visual_compressed_uvd_hessian.shape == (6, 6)

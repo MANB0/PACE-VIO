@@ -1,11 +1,12 @@
-# MACVO Realtime T2 VIO
+# PACE-VIO
 
-这是经过裁切的实时双目视觉惯性里程计工程。运行顺序固定为：
+**PACE-VIO**（Pointwise Uncertainty-Aware Compressed Estimation for
+Visual-Inertial Odometry）是经过裁切的实时双目视觉惯性里程计工程。运行顺序固定为：
 
 ```text
-双目图像 -> MACVO 前端 -> 当前帧对 UVD 压缩视觉因子
-原始 IMU  -> 局部坐标系预积分 ----------------------> 两状态 T2 后端
-                                                     -> IMU 中心轨迹 + 实时网页
+双目图像 -> MACVO 前端 -> PACE 压缩 UVD 视觉因子
+原始 IMU  -> 局部坐标系预积分 ---------------------> 两状态或 iSAM2 后端
+                                                    -> IMU 中心轨迹 + 实时网页
 ```
 
 ## 唯一实现
@@ -14,7 +15,10 @@
 
 因此，后续功能必须直接在本实现中完成并通过本仓库测试；不得依赖 `macvo-dev` 的实验脚本、历史视觉缓存或完整分支中的隐式运行路径。
 
-该分支不读取视觉缓存。MACVO 必须先完成当前帧对的视觉计算，T2 后端随后使用同一帧对的视觉量和对应时间区间 IMU。网页显示独立的 `MACVO raw`、`VIO committed` 和可选 GT，并支持轨迹缩放/拖动、双目图像、IMU 曲线及运行中回放。
+该分支不读取视觉缓存。MACVO 必须先完成当前帧对的视觉计算，PACE-VIO 后端随后使用同一帧对的视觉量和对应时间区间 IMU。网页显示独立的 `MACVO raw`、`VIO committed` 和可选 GT，并支持轨迹缩放/拖动、双目图像、IMU 曲线及运行中回放。
+
+公开名称、实现变体及旧接口兼容范围见
+[PACE-VIO 生产仓库命名契约](docs/PACE_VIO_NAMING_AUDIT_CN.md)。
 
 ## 已验证环境
 
@@ -23,7 +27,7 @@
 - PyTorch 2.4.0，PyPose 0.9.5
 - 640x480 双目图像至少约 6 GB VRAM
 
-CPU 负责 T2 求解，GPU 负责 MACVO 神经网络前端。没有 CUDA GPU 时当前前端不能运行。
+CPU 负责 PACE-VIO 后端求解，GPU 负责 MACVO 神经网络前端。没有 CUDA GPU 时当前前端不能运行。
 
 ## 1. Clone 与环境
 
@@ -31,8 +35,8 @@ CPU 负责 T2 求解，GPU 负责 MACVO 神经网络前端。没有 CUDA GPU 时
 git clone --depth 1 --branch codex/realtime-minimal \
   https://github.com/MANB0/macvo-realtime-t2-vio.git
 cd macvo-realtime-t2-vio
-bash Scripts/bootstrap_conda.sh macvo-t2
-conda activate macvo-t2
+bash Scripts/bootstrap_conda.sh pace-vio
+conda activate pace-vio
 ```
 
 脚本会安装经验证的 CUDA 12.1 PyTorch、其余依赖，并下载和校验唯一需要的模型 `Model/MACVO_FrontendCov.pth`。也可以手动安装后执行：
@@ -69,7 +73,7 @@ metadata 读取时间字段，也不根据数据端点自动估计偏移。
 启动时存在静止段的数据默认使用自适应初始化：
 
 ```bash
-python Scripts/run_realtime_t2.py \
+python Scripts/run_pace_vio.py \
   --dataset /absolute/path/to/my_sequence
 ```
 
@@ -80,37 +84,39 @@ python Scripts/run_realtime_t2.py \
 固定时长模式必须显式给出时长，例如固定使用前三秒：
 
 ```bash
-python Scripts/run_realtime_t2.py \
+python Scripts/run_pace_vio.py \
   --dataset /absolute/path/to/my_sequence \
   --static-init-mode fixed \
   --static-init-duration-s 3.0
 ```
 
-网页默认在 [http://127.0.0.1:8765/](http://127.0.0.1:8765/) 打开。结果写入 `Results/realtime_t2/<dataset-name>/`。
+网页默认在 [http://127.0.0.1:8765/](http://127.0.0.1:8765/) 打开。结果写入 `Results/pace_vio/<dataset-name>/`。
 
 ### iSAM2 增量后端
 
-默认 `--vio-backend two_state` 保留已验证的两状态 T2 求解器。iSAM2 后端消费同一份
-`T2FactorPacket`，其中包含压缩 UVD 视觉因子、局部坐标系 IMU 预积分因子和 bias
-random-walk 因子；它不会先运行两状态求解器再平滑其位姿。
+默认 `--vio-backend two_state` 保留已验证的两状态求解器，生产视觉因子默认仍为
+`--visual-factor pace`。two-state 和 iSAM2 都可原生接收 `pose`、`uvd`、`pace`
+三种视觉表达，并共用局部坐标系 IMU 预积分与 bias random-walk 因子；iSAM2
+不会先运行两状态求解器再平滑其位姿。
 
 iSAM2 需要 GTSAM C++ 开发文件。若 GTSAM 安装在非标准位置，先设置
 `GTSAM_DIR`，然后构建扩展：
 
 ```bash
 export GTSAM_DIR=/absolute/path/to/lib/cmake/GTSAM
-bash Scripts/build_t2_isam2.sh
+bash Scripts/build_pace_vio_isam2.sh
 ```
 
 冻结版本的实现边界、测试和三场景结果记录在
-[`docs/T2_ISAM2_FREEZE_CN.md`](docs/T2_ISAM2_FREEZE_CN.md)。
+[`docs/PACE_VIO_FREEZE_CN.md`](docs/PACE_VIO_FREEZE_CN.md)。
 
 启动固定三秒初始化的 iSAM2 实时流水线：
 
 ```bash
-python Scripts/run_realtime_t2.py \
+python Scripts/run_pace_vio.py \
   --dataset /absolute/path/to/my_sequence \
   --vio-backend isam2 \
+  --visual-factor pace \
   --static-init-mode fixed \
   --static-init-duration-s 3.0
 ```
@@ -121,7 +127,7 @@ python Scripts/run_realtime_t2.py \
 没有静止起始段的数据必须使用 `off` 模式：
 
 ```bash
-python Scripts/run_realtime_t2.py \
+python Scripts/run_pace_vio.py \
   --dataset /absolute/path/to/my_sequence \
   --static-init-mode off
 ```
@@ -129,7 +135,7 @@ python Scripts/run_realtime_t2.py \
 这会使用较弱的零速度/零 bias 初值，并不等价于可靠的静止初始化。建议先检查配置而不运行网络：
 
 ```bash
-python Scripts/run_realtime_t2.py \
+python Scripts/run_pace_vio.py \
   --dataset /absolute/path/to/my_sequence \
   --dry-run
 ```
@@ -141,9 +147,12 @@ python Scripts/run_realtime_t2.py \
 --mode serial             串行前端/后端，用于调试
 --no-live-display         关闭网页
 --dashboard-port 8766     修改网页端口
---cpu-threads 4           T2 求解线程数
---vio-backend two_state   默认：原两状态 T2 后端
+--cpu-threads 4           PACE-VIO 后端求解线程数
+--vio-backend two_state   默认：两状态 PACE-VIO 后端
 --vio-backend isam2       增量 iSAM2 后端，需要先构建 C++ 扩展
+--visual-factor pace      默认：PACE 压缩视觉因子
+--visual-factor pose      鲁棒相对位姿因子，用于对照实验
+--visual-factor uvd       原生逐点非线性 UVD 因子，用于对照实验
 --static-init-mode adaptive  默认：自适应静止初始化
 --static-init-mode fixed     固定窗口，必须同时指定时长
 --static-init-mode off       不假设存在静止起始段
@@ -158,7 +167,7 @@ python Scripts/run_realtime_t2.py \
 - VIO 输出位置以 IMU 中心为参考点。
 - `MACVO raw` 保留纯视觉历史；网页对比时根据 metadata 外参转换到约定参考点。
 - IMU 预积分只使用 body-frame 原始测量、dt、bias 线性化点和噪声参数；重力仅进入因子残差。
-- 默认 T2 为 `two_state_fixed_lag + compressed_uvd`，不是 T0 相对位姿因子。
+- PACE-VIO 默认使用 `two_state_fixed_lag + compressed_uvd`，不是 T0 相对位姿因子。
 - 四个连续时间 IMU 噪声密度和相机/IMU 外参从 `metadata.json` 读取；离散化使用 CSV 纳秒时间戳，不依赖名义采样频率。
 
 ## 历史回退
@@ -166,3 +175,27 @@ python Scripts/run_realtime_t2.py \
 私有仓库 `main` 和标签 `realtime-t2-full-20260721` 保存裁切前的只读快照；它们不是当前实现，也不接受独立功能开发。需要恢复历史代码时，应先逐文件审计，再把必要改动移植到当前默认分支并运行本仓库回归测试。
 
 本工程基于 MAC-VO，许可证见 [LICENSE](LICENSE)。模型来自 [MAC-VO model release](https://github.com/MAC-VO/MAC-VO/releases/tag/model)。
+
+## 旧名称兼容
+
+`T2` 是 PACE 压缩视觉因子的早期工程代号。旧脚本、配置键、结果目录和
+C++ 扩展 ABI 暂时保留兼容入口，但不再作为论文、界面或新代码的算法名称。
+新代码应使用 `PACE-VIO`、`PACEFactorPacket`、`run_pace_vio.py` 和
+`build_pace_vio_isam2.sh`。
+
+## 论文全量重跑
+
+环境脚本会同时准备 MACVO 前端、项目本地 GTSAM 和 PACE-VIO iSAM2
+扩展。复制 `Config/paper_experiments.example.json`，只修改数据集路径和各
+序列的静止初始化模式，然后执行：
+
+```bash
+python Scripts/run_paper_experiments.py \
+  --manifest Config/paper_experiments.json
+```
+
+该入口固定对每个场景运行 `Pose-iSAM2`、`UVD-iSAM2`、`PACE-Two`、
+`PACE-iSAM2` 和 `PACE-VIO` 五种组合，均使用完整活动序列。结果根目录下的
+`paper_run_summary.csv` 可直接用于论文表格，`paper_comparison_sources.json`
+记录每项对比对应的原始结果包；每状态 APE、每边 RPE、最终/在线轨迹、
+因子构造时间和后端更新时间仍保存在各运行的 `paper_evaluation/` 中。

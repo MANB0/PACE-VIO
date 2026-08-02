@@ -2,13 +2,17 @@ import pypose as pp
 import pytest
 import torch
 
-from Utility.T2FactorPacket import T2FactorPacket
+from Utility.PACEFactorPacket import PACEFactorPacket
+from Utility.PACEISAM2Backend import IncrementalPACEISAM2Backend
 from Utility.T2ISAM2Backend import IncrementalT2ISAM2Backend
 from Module.Optimization.TwoFramePGO.Optimizer import TwoFrame_PGO
+from Utility.Point import point2pixel_NED
 from Utility.TwoStateVIO import (
     ImuPreintegrationFactor,
     LinearizedUVDPoseFactor,
     NavigationState,
+    RelativePoseFactor,
+    UVDFactor,
 )
 
 
@@ -39,15 +43,63 @@ def _packet(
     x_j: float,
     *,
     state_i: NavigationState | None = None,
-) -> T2FactorPacket:
+    visual_mode: str = "compressed_uvd",
+) -> PACEFactorPacket:
     extrinsic = EXTRINSIC_CI.tensor()
     covariance = torch.eye(9, dtype=torch.float64) * 1.0e-3
     bias_covariance = torch.eye(6, dtype=torch.float64) * 1.0e-6
-    return T2FactorPacket.create(
+    initial_i = _state(x_i) if state_i is None else state_i
+    initial_j = _state(x_j)
+    if visual_mode == "compressed_uvd":
+        visual = LinearizedUVDPoseFactor(
+            reference_relative_CjCi=pp.se3(
+                torch.tensor([[-0.01, 0.0, 0.0, 0.0, 0.0, 0.0]], dtype=torch.float64)
+            ).Exp().tensor(),
+            sqrt_information=torch.eye(6, dtype=torch.float64) * 10.0,
+            residual_offset=torch.zeros(6, dtype=torch.float64),
+            extrinsic_CI=extrinsic,
+            marginal_mode="full",
+        )
+    elif visual_mode == "relative_pose":
+        measurement = pp.SE3(initial_i.pose_WB).Inv() @ pp.SE3(initial_j.pose_WB)
+        visual = RelativePoseFactor(
+            measurement_BiBj=measurement.tensor(),
+            covariance=torch.eye(6, dtype=torch.float64) * 1.0e-3,
+            huber_delta=3.0,
+        )
+    elif visual_mode == "direct_uvd":
+        points = torch.tensor(
+            [[4.0, -0.4, -0.2], [5.0, 0.2, 0.1], [6.0, 0.5, -0.3]],
+            dtype=torch.float64,
+        )
+        intrinsic = torch.tensor(
+            [[320.0, 0.0, 320.0], [0.0, 320.0, 240.0], [0.0, 0.0, 1.0]],
+            dtype=torch.float64,
+        )
+        pose_WCi = pp.SE3(initial_i.pose_WB) @ EXTRINSIC_CI.Inv()
+        pose_WCj = pp.SE3(initial_j.pose_WB) @ EXTRINSIC_CI.Inv()
+        relative_CjCi = pose_WCj.Inv() @ pose_WCi
+        points_j = relative_CjCi.Act(points)
+        baseline = 0.225
+        visual = UVDFactor(
+            points_Ci=points,
+            target_uv=point2pixel_NED(points_j, intrinsic),
+            target_disparity=(
+                intrinsic[0, 0] * baseline / points_j[:, 0:1]
+            ),
+            covariance_uvd=torch.eye(3, dtype=torch.float64).repeat(3, 1, 1),
+            intrinsic=intrinsic,
+            baseline=baseline,
+            extrinsic_CI=extrinsic,
+            huber_delta=0.1,
+        )
+    else:
+        raise ValueError(visual_mode)
+    return PACEFactorPacket.create(
         frame_i=frame_i,
         frame_j=frame_j,
-        state_i_initial=_state(x_i) if state_i is None else state_i,
-        state_j_initial=_state(x_j),
+        state_i_initial=initial_i,
+        state_j_initial=initial_j,
         imu=ImuPreintegrationFactor(
             delta_rotation=torch.zeros(3, dtype=torch.float64),
             delta_velocity=torch.zeros(3, dtype=torch.float64),
@@ -61,21 +113,13 @@ def _packet(
             gravity_world=torch.zeros(3, dtype=torch.float64),
             gravity_handling="residual",
         ),
-        visual=LinearizedUVDPoseFactor(
-            reference_relative_CjCi=pp.se3(
-                torch.tensor([[-0.01, 0.0, 0.0, 0.0, 0.0, 0.0]], dtype=torch.float64)
-            ).Exp().tensor(),
-            sqrt_information=torch.eye(6, dtype=torch.float64) * 10.0,
-            residual_offset=torch.zeros(6, dtype=torch.float64),
-            extrinsic_CI=extrinsic,
-            marginal_mode="full",
-        ),
+        visual=visual,
         extrinsic_CI=extrinsic,
     )
 
 
-def _backend() -> IncrementalT2ISAM2Backend:
-    return IncrementalT2ISAM2Backend(
+def _backend() -> IncrementalPACEISAM2Backend:
+    return IncrementalPACEISAM2Backend(
         initial_prior_std={
             "pose_translation_std": 1.0e-5,
             "pose_rotation_std": 1.0e-5,
@@ -84,6 +128,10 @@ def _backend() -> IncrementalT2ISAM2Backend:
             "gyro_bias_std": 0.02,
         }
     )
+
+
+def test_legacy_t2_backend_name_is_a_compatibility_alias():
+    assert IncrementalT2ISAM2Backend is IncrementalPACEISAM2Backend
 
 
 def test_incremental_backend_consumes_packets_and_revises_history():
@@ -106,6 +154,22 @@ def test_incremental_backend_consumes_packets_and_revises_history():
     assert first.update_ms >= 0.0 and second.update_ms >= 0.0
     assert torch.isfinite(second.state.pose_WB).all()
     assert second.initial_pose_mismatch_norm < 1.0e-9
+
+
+@pytest.mark.parametrize(
+    "visual_mode",
+    ("relative_pose", "direct_uvd", "compressed_uvd"),
+)
+def test_incremental_backend_accepts_all_visual_factor_modes(visual_mode: str):
+    backend = _backend()
+    update = backend.consume(
+        _packet(90, 91, 0.0, 0.01, visual_mode=visual_mode)
+    )
+
+    assert update.frame_idx == 91
+    assert update.update_ms >= 0.0
+    assert update.visual_cost >= 0.0
+    assert torch.isfinite(update.state.pose_WB).all()
 
 
 def test_incremental_backend_rejects_discontinuous_packet():

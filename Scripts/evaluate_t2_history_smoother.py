@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Evaluate online T2 and the read-only full-history smoother on one frame range."""
+"""Evaluate PACE-VIO-2S and the read-only full-history smoother."""
 
 from __future__ import annotations
 
@@ -227,7 +227,7 @@ def write_plot(
     gt = truth[["tx", "ty", "tz"]].to_numpy(np.float64)
     curves = {
         "GT": (gt - gt[0], "#111827"),
-        "Online T2": (
+        "Online PACE-VIO-2S": (
             online[["tx_nwu", "ty_nwu", "tz_nwu"]].to_numpy(np.float64)
             - online[["tx_nwu", "ty_nwu", "tz_nwu"]].to_numpy(np.float64)[0],
             "#dc2626",
@@ -249,7 +249,7 @@ def write_plot(
         axis.axis("equal")
         axis.grid(alpha=0.25)
     axes[0].legend()
-    fig.suptitle("T2 online vs read-only full-history smoothing, frames 90-299")
+    fig.suptitle("PACE-VIO-2S vs read-only full-history smoothing, frames 90-299")
     fig.savefig(output / "t2_online_vs_history_smoother.png", dpi=180)
     plt.close(fig)
 
@@ -260,9 +260,9 @@ def write_plot(
             for name, (values, color) in curves.items()
         ],
     }
-    html = """<!doctype html><html><head><meta charset='utf-8'><title>T2 history smoother</title>
+    html = """<!doctype html><html><head><meta charset='utf-8'><title>PACE-VIO history smoother</title>
 <style>body{margin:0;background:#f4f7fb;color:#172033;font:15px Arial,sans-serif}header{padding:22px 28px;background:white;border-bottom:1px solid #dbe3ef}h1{font-size:24px;margin:0 0 6px}main{padding:18px 28px}.toolbar{display:flex;gap:8px;align-items:center;margin-bottom:12px}button{border:1px solid #b9c7da;background:white;padding:8px 13px;border-radius:6px;cursor:pointer}button.active{background:#2563eb;color:white}.layout{display:grid;grid-template-columns:minmax(0,1fr) 320px;gap:16px}.panel{background:white;border:1px solid #dbe3ef;border-radius:8px;padding:14px}canvas{width:100%;height:620px;display:block;cursor:grab}.metric{padding:10px 0;border-bottom:1px solid #e7edf5}.metric b{display:block;margin-bottom:5px}.swatch{display:inline-block;width:18px;height:3px;margin-right:8px;vertical-align:middle}@media(max-width:900px){.layout{grid-template-columns:1fr}canvas{height:480px}}</style></head>
-<body><header><h1>T2 Online vs Full-history 15D Smoother</h1><div>Frames 90-299, IMU center, NWU, translation rebased at frame 90. No SE(3) fitting or scale correction.</div></header><main><div class='toolbar'><button data-view='xy' class='active'>XY</button><button data-view='xz'>XZ</button><button data-view='yz'>YZ</button><button id='reset'>Reset</button></div><div class='layout'><div class='panel'><canvas id='plot'></canvas></div><aside class='panel' id='metrics'></aside></div></main>
+<body><header><h1>PACE-VIO-2S vs Full-history 15D Smoother</h1><div>Frames 90-299, IMU center, NWU, translation rebased at frame 90. No SE(3) fitting or scale correction.</div></header><main><div class='toolbar'><button data-view='xy' class='active'>XY</button><button data-view='xz'>XZ</button><button data-view='yz'>YZ</button><button id='reset'>Reset</button></div><div class='layout'><div class='panel'><canvas id='plot'></canvas></div><aside class='panel' id='metrics'></aside></div></main>
 <script>const D=__DATA__;const c=document.getElementById('plot'),x=c.getContext('2d');let view='xy',manual=false,scale=1,ox=0,oy=0,drag=null;const idx={xy:[0,1],xz:[0,2],yz:[1,2]};
 function resize(){const r=c.getBoundingClientRect(),d=devicePixelRatio||1;c.width=r.width*d;c.height=r.height*d;x.setTransform(d,0,0,d,0,0);draw()}
 function bounds(){const k=idx[view],v=D.traces.flatMap(t=>t.xyz.map(p=>[p[k[0]],p[k[1]]]));let xs=v.map(p=>p[0]),ys=v.map(p=>p[1]);return [Math.min(...xs),Math.max(...xs),Math.min(...ys),Math.max(...ys)]}
@@ -367,13 +367,13 @@ def main() -> None:
     (output / "t2_history_smoother_evaluation_summary.json").write_text(
         json.dumps(summary, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
     )
-    report = f"""# T2 全历史 15 维平滑器 300 帧离线验证
+    report = f"""# PACE-VIO 全历史 15 维平滑器 300 帧离线验证
 
 ## 结论
 
-本实验只读取在线 T2 已生成的 IMU、bias random-walk 和压缩 UVD 视觉因子，不重新运行 MACVO，也不把结果反馈给实时 T2。在线轨迹输入与既有 T2 结果在重基准后的最大位置差为 `{baseline_contract['max_rebased_position_difference_m'] if baseline_contract else float('nan'):.3e} m`。
+本实验只读取在线 PACE-VIO-2S 已生成的 IMU、bias random-walk 和压缩 UVD 视觉因子，不重新运行 MACVO，也不把结果反馈给实时 PACE-VIO-2S。在线轨迹输入与既有 PACE-VIO-2S 结果在重基准后的最大位置差为 `{baseline_contract['max_rebased_position_difference_m'] if baseline_contract else float('nan'):.3e} m`。
 
-| 指标 | 在线 T2 | 全历史 15D | 改善 |
+| 指标 | 在线 PACE-VIO-2S | 全历史 15D | 改善 |
 |---|---:|---:|---:|
 | 3D ATE RMSE | {online_metric['ate_xyz_rmse_m']:.6f} m | {smooth_metric['ate_xyz_rmse_m']:.6f} m | {summary['improvement_percent']['ate_xyz_rmse_m']:.2f}% |
 | XY ATE RMSE | {online_metric['ate_xy_rmse_m']:.6f} m | {smooth_metric['ate_xy_rmse_m']:.6f} m | {summary['improvement_percent']['ate_xy_rmse_m']:.2f}% |
@@ -386,7 +386,7 @@ def main() -> None:
 
 ## 因子代价
 
-在线两状态估计在下一轮会重新调整当前状态，而已经移出活动窗口的旧 IMU 和 bias random-walk 因子不会再次闭合。因此，把最终在线状态重新放回完整历史图时，IMU 与 bias 代价分别为 `{cost_summary['online']['imu']:.6g}` 和 `{cost_summary['online']['bias']:.6g}`，这不是归档字段错位。全历史联合优化后，prior、IMU、bias 和压缩视觉代价分别为 `{cost_summary['smoothed']['prior']:.6g}`、`{cost_summary['smoothed']['imu']:.6g}`、`{cost_summary['smoothed']['bias']:.6g}`、`{cost_summary['smoothed']['visual']:.6g}`。该结果说明历史平滑确实在同一套 T2 因子上重新分配了误差，而不是对轨迹坐标做低通滤波。
+在线两状态估计在下一轮会重新调整当前状态，而已经移出活动窗口的旧 IMU 和 bias random-walk 因子不会再次闭合。因此，把最终在线状态重新放回完整历史图时，IMU 与 bias 代价分别为 `{cost_summary['online']['imu']:.6g}` 和 `{cost_summary['online']['bias']:.6g}`，这不是归档字段错位。全历史联合优化后，prior、IMU、bias 和压缩视觉代价分别为 `{cost_summary['smoothed']['prior']:.6g}`、`{cost_summary['smoothed']['imu']:.6g}`、`{cost_summary['smoothed']['bias']:.6g}`、`{cost_summary['smoothed']['visual']:.6g}`。该结果说明历史平滑确实在同一套 PACE 因子上重新分配了误差，而不是对轨迹坐标做低通滤波。
 
 ## 适用范围
 

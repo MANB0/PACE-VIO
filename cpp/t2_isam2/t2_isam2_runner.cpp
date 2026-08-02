@@ -536,7 +536,7 @@ void write_solve_summary(const fs::path& path, const SolveSummary& summary,
   std::ofstream stream(path);
   stream << std::setprecision(17)
       << "{\n"
-      << "  \"backend\": \"T2 compressed UVD + cached T2 IMU + iSAM2\",\n"
+      << "  \"backend\": \"PACE compressed UVD + cached IMU + iSAM2\",\n"
       << "  \"state_count\": " << state_count << ",\n"
       << "  \"edge_count\": " << edge_count << ",\n"
       << "  \"elapsed_s\": " << summary.elapsed_s << ",\n"
@@ -580,14 +580,14 @@ int run(const Config& config) {
       audit.max_visual_jacobian_error, audit.max_imu_residual_error,
       audit.max_imu_jacobian_error});
   if (!audit.finite || worst_audit > config.audit_absolute_tolerance) {
-    throw std::runtime_error("T2/GTSAM cross-language factor audit failed; inspect factor_equivalence_summary.json");
+    throw std::runtime_error("PACE/GTSAM cross-language factor audit failed; inspect factor_equivalence_summary.json");
   }
 
   const SolveSummary solve = solve_incrementally(
       config, states, edges, extrinsic_CI, prior_sigma);
   write_solve_summary(config.output / "isam2_summary.json", solve, states.size(), edges.size());
   std::cout << std::setprecision(10)
-      << "T2-iSAM2 completed " << edges.size() << " edges\n"
+      << "PACE-VIO iSAM2 completed " << edges.size() << " edges\n"
       << "  factor audit max abs: " << worst_audit << "\n"
       << "  update median/P95/max: " << solve.update_median_ms << " / "
       << solve.update_p95_ms << " / " << solve.update_max_ms << " ms\n"

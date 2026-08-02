@@ -46,13 +46,12 @@ class IOdometry(ABC, Generic[T_Data]):
             body_poses = convert_pose_frame(body_poses, "NED", pose_output_frame)
             time_ns   : np.ndarray = global_map.frames.data["time_ns"].tensor.cpu().numpy()
 
-            write_timed_se3_csv(saveto.path("poses.csv"), time_ns, body_poses)
             saveto.path("pose_coordinate_frame.txt").write_text(pose_output_frame + "\n", encoding="utf-8")
 
-            # Keep Map pose semantics at the visual sensor origin, but also
-            # export the exact IMU-origin trajectory used by the VIO factors.
-            # T_CI is metadata-derived and stored on every frame; composing it
-            # here avoids changing the pose that MACVO expects on the next edge.
+            # Keep Map pose semantics at the visual sensor origin, but make the
+            # canonical exported trajectory the IMU-origin state used by VIO.
+            # The explicitly named camera output is retained for frontend
+            # diagnostics without making its reference point ambiguous.
             if "imu_vio_sensor_T_imu" in global_map.frames.data:
                 camera_T_imu_all = (
                     global_map.frames.data["imu_vio_sensor_T_imu"].tensor
@@ -75,16 +74,28 @@ class IOdometry(ABC, Generic[T_Data]):
                     pose_output_frame,
                 )
                 write_timed_se3_csv(
+                    saveto.path("poses.csv"),
+                    time_ns,
+                    imu_poses_output,
+                )
+                write_timed_se3_csv(
                     saveto.path("poses_imu.csv"),
                     time_ns,
                     imu_poses_output,
                 )
+                write_timed_se3_csv(
+                    saveto.path("poses_camera.csv"),
+                    time_ns,
+                    body_poses,
+                )
                 saveto.path("pose_reference_points.json").write_text(
                     json.dumps(
                         {
-                            "schema_version": 1,
-                            "poses.csv": "visual_sensor_origin (camera for current HoloOcean runs)",
-                            "poses_imu.csv": "IMU origin used by VIO state T_WI",
+                            "schema_version": 2,
+                            "canonical_trajectory": "poses.csv",
+                            "poses.csv": "IMU origin used by VIO state T_WI",
+                            "poses_imu.csv": "compatibility alias of poses.csv at the IMU origin",
+                            "poses_camera.csv": "visual sensor origin used by the MACVO map",
                             "runtime_extrinsic_field": "frames//imu_vio_sensor_T_imu",
                             "runtime_extrinsic_semantics": (
                                 "T_CI maps raw IMU frame I to MACVO camera frame C; "
@@ -99,8 +110,10 @@ class IOdometry(ABC, Generic[T_Data]):
                         ensure_ascii=False,
                     )
                     + "\n",
-                    encoding="utf-8",
-                )
+                      encoding="utf-8",
+                  )
+            else:
+                write_timed_se3_csv(saveto.path("poses.csv"), time_ns, body_poses)
             np.savez_compressed(saveto.path("tensor_map.npz"), **global_map.serialize())
             if hasattr(self, "export_diagnostics"):
                 self.export_diagnostics(saveto)  # type: ignore[attr-defined]

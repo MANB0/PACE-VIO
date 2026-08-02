@@ -442,6 +442,7 @@ if __name__ == "__main__":
 
     _diag_writer = None
     _live_dashboard = None
+    _online_pose_recorder = None
     try:
         # Setup logging and visualization
         if args.useRR:
@@ -490,6 +491,14 @@ if __name__ == "__main__":
             sequence = sequence.preload()
 
         system = MACVO[StereoFrame].from_config(asNamespace(exp_space.config))
+
+        from Utility.OnlinePoseRecorder import OnlinePoseRecorder
+
+        _online_pose_recorder = OnlinePoseRecorder(
+            exp_space.path("poses_online.csv"),
+            output_world_frame=str(getattr(sequence, "pose_output_frame", "NED")),
+        )
+        system.on_optimize_writeback.append(_online_pose_recorder)
 
         if _live_dashboard is not None:
             # This hook runs after the previous backend result has been written
@@ -661,6 +670,8 @@ if __name__ == "__main__":
             header, result = EvaluateSequences([str(exp_space.folder)], correct_scale=False)
             print_as_table(header, result)
     finally:
+        if _online_pose_recorder is not None:
+            _online_pose_recorder.close()
         if _diag_writer is not None:
             _diag_writer.close()
         if args.useRR:

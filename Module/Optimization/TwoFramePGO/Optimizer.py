@@ -23,8 +23,13 @@ from Utility.IMUKinematics import (
     vio_preintegrated_covariance_matrix,
 )
 from Utility.RelativePoseFactorCache import camera_factor_to_body_factor
-from Utility.T2FactorPacket import T2FactorPacket
-from Utility.T2ISAM2Backend import IncrementalT2ISAM2Backend
+from Utility.PACEFactorPacket import PACEFactorPacket
+from Utility.PACEISAM2Backend import IncrementalPACEISAM2Backend
+from Utility.NearZeroVelocityDetector import (
+    TurningNearZeroVelocityDetector,
+    TurningNearZeroVelocityDetectorV2,
+    zero_translation_kinematic_evidence,
+)
 from Utility.TwoStateVIO import (
     ImuPreintegrationFactor,
     LinearizedUVDPoseFactor,
@@ -2460,10 +2465,24 @@ class TwoFrame_PGO(IOptimizer[GraphInput, dict, GraphOutput]):
                 "two_state_backend must be either 'two_state' or 'isam2', "
                 f"got {two_state_backend_name!r}"
             )
-        if two_state_backend_name == "isam2" and visual_factor_mode != "compressed_uvd":
+        near_zero_velocity_enable = bool(
+            getattr(config, "two_state_near_zero_velocity_enable", False)
+        )
+        near_zero_velocity_version = str(
+            getattr(
+                config,
+                "two_state_near_zero_velocity_detector_version",
+                "v1",
+            )
+        ).strip().lower()
+        if near_zero_velocity_version not in {"v1", "v2"}:
             raise ValueError(
-                "the incremental iSAM2 backend requires "
-                "two_state_visual_factor_mode='compressed_uvd'"
+                "two_state_near_zero_velocity_detector_version must be "
+                "'v1' or 'v2'"
+            )
+        if near_zero_velocity_enable and two_state_backend_name != "isam2":
+            raise ValueError(
+                "the near-zero-velocity factor currently requires the iSAM2 backend"
             )
         initial_prior_std = {
             "pose_translation_std": float(
@@ -2483,7 +2502,7 @@ class TwoFrame_PGO(IOptimizer[GraphInput, dict, GraphOutput]):
             ),
         }
         isam2_backend = (
-            IncrementalT2ISAM2Backend(
+            IncrementalPACEISAM2Backend(
                 initial_prior_std=initial_prior_std,
                 relinearize_threshold=float(
                     getattr(config, "two_state_isam2_relinearize_threshold", 0.01)
@@ -2498,6 +2517,104 @@ class TwoFrame_PGO(IOptimizer[GraphInput, dict, GraphOutput]):
             if two_state_backend_name == "isam2"
             else None
         )
+        near_zero_velocity_detector = None
+        if near_zero_velocity_enable and near_zero_velocity_version == "v1":
+            near_zero_velocity_detector = TurningNearZeroVelocityDetector(
+                maximum_speed_m_s=float(
+                    getattr(
+                        config,
+                        "two_state_near_zero_velocity_maximum_speed_m_s",
+                        0.18,
+                    )
+                ),
+                minimum_imu_angular_rate_rad_s=float(
+                    getattr(
+                        config,
+                        "two_state_near_zero_velocity_minimum_imu_angular_rate_rad_s",
+                        0.15,
+                    )
+                ),
+                minimum_visual_angular_rate_rad_s=float(
+                    getattr(
+                        config,
+                        "two_state_near_zero_velocity_minimum_visual_angular_rate_rad_s",
+                        0.12,
+                    )
+                ),
+                maximum_angular_rate_disagreement_rad_s=float(
+                    getattr(
+                        config,
+                        "two_state_near_zero_velocity_maximum_angular_rate_disagreement_rad_s",
+                        0.35,
+                    )
+                ),
+                enter_hold_s=float(
+                    getattr(
+                        config,
+                        "two_state_near_zero_velocity_enter_hold_s",
+                        0.20,
+                    )
+                ),
+                release_hold_s=float(
+                    getattr(
+                        config,
+                        "two_state_near_zero_velocity_release_hold_s",
+                        0.10,
+                    )
+                ),
+            )
+        elif near_zero_velocity_enable:
+            near_zero_velocity_detector = TurningNearZeroVelocityDetectorV2(
+                minimum_imu_angular_rate_rad_s=float(
+                    getattr(
+                        config,
+                        "two_state_near_zero_velocity_v2_minimum_imu_angular_rate_rad_s",
+                        0.30,
+                    )
+                ),
+                minimum_visual_angular_rate_rad_s=float(
+                    getattr(
+                        config,
+                        "two_state_near_zero_velocity_v2_minimum_visual_angular_rate_rad_s",
+                        0.25,
+                    )
+                ),
+                maximum_rotation_vector_rate_difference_rad_s=float(
+                    getattr(
+                        config,
+                        "two_state_near_zero_velocity_v2_maximum_rotation_vector_rate_difference_rad_s",
+                        0.08,
+                    )
+                ),
+                minimum_rotation_axis_cosine=float(
+                    getattr(
+                        config,
+                        "two_state_near_zero_velocity_v2_minimum_rotation_axis_cosine",
+                        0.90,
+                    )
+                ),
+                maximum_zero_translation_nis_per_dof=float(
+                    getattr(
+                        config,
+                        "two_state_near_zero_velocity_v2_maximum_zero_translation_nis_per_dof",
+                        3.5,
+                    )
+                ),
+                enter_hold_s=float(
+                    getattr(
+                        config,
+                        "two_state_near_zero_velocity_enter_hold_s",
+                        0.20,
+                    )
+                ),
+                release_hold_s=float(
+                    getattr(
+                        config,
+                        "two_state_near_zero_velocity_release_hold_s",
+                        0.10,
+                    )
+                ),
+            )
 
         match (config.autodiff, config.graph_type):
             case (True, "icp"):
@@ -2541,6 +2658,18 @@ class TwoFrame_PGO(IOptimizer[GraphInput, dict, GraphOutput]):
             "imu_factor_mode": imu_factor_mode,
             "two_state_backend_name": two_state_backend_name,
             "two_state_isam2_backend": isam2_backend,
+            "two_state_near_zero_velocity_detector": near_zero_velocity_detector,
+            "two_state_near_zero_velocity_detector_version": (
+                near_zero_velocity_version
+            ),
+            "two_state_near_zero_velocity_prior_std_m_s": float(
+                getattr(
+                    config,
+                    "two_state_near_zero_velocity_prior_std_m_s",
+                    0.01,
+                )
+            ),
+            "two_state_near_zero_velocity_last_decision": None,
             "two_state_isam2_history_publish_interval": max(
                 1,
                 int(
@@ -2658,11 +2787,11 @@ class TwoFrame_PGO(IOptimizer[GraphInput, dict, GraphOutput]):
         torch.Tensor,
     ]:
         backend = context.get("two_state_isam2_backend")
-        if not isinstance(backend, IncrementalT2ISAM2Backend) or not backend.initialized:
+        if not isinstance(backend, IncrementalPACEISAM2Backend) or not backend.initialized:
             raise RuntimeError("iSAM2 history requested before backend initialization")
         packet = context.get("two_state_last_factor_packet")
-        if not isinstance(packet, T2FactorPacket):
-            raise RuntimeError("iSAM2 history has no matching T2 factor packet")
+        if not isinstance(packet, PACEFactorPacket):
+            raise RuntimeError("iSAM2 history has no matching PACE-VIO factor packet")
 
         history = backend.history() if history is None else history
         if len(history) < 2:
@@ -2695,7 +2824,7 @@ class TwoFrame_PGO(IOptimizer[GraphInput, dict, GraphOutput]):
         if str(context.get("two_state_backend_name", "two_state")) != "isam2":
             return context, None
         backend = context.get("two_state_isam2_backend")
-        if not isinstance(backend, IncrementalT2ISAM2Backend) or not backend.initialized:
+        if not isinstance(backend, IncrementalPACEISAM2Backend) or not backend.initialized:
             return context, None
 
         started = time.perf_counter()
@@ -3785,8 +3914,8 @@ class TwoFrame_PGO(IOptimizer[GraphInput, dict, GraphOutput]):
             }
         factor_build_s = time.perf_counter() - factor_build_start
         factor_packet = None
-        if isinstance(visual, LinearizedUVDPoseFactor) and not use_cross_edge_sampling:
-            factor_packet = T2FactorPacket.create(
+        if not use_cross_edge_sampling:
+            factor_packet = PACEFactorPacket.create(
                 frame_i=from_idx,
                 frame_j=frame_idx,
                 state_i_initial=state_i,
@@ -3840,16 +3969,165 @@ class TwoFrame_PGO(IOptimizer[GraphInput, dict, GraphOutput]):
         solve_start = time.perf_counter()
         isam2_update = None
         isam2_history_states = None
+        near_zero_velocity_decision = None
         backend_name = str(context.get("two_state_backend_name", "two_state"))
         if backend_name == "isam2":
             if use_cross_edge_sampling:
                 raise ValueError("iSAM2 backend does not accept SA-v2 cross-edge packets")
             if factor_packet is None:
-                raise ValueError("iSAM2 backend requires a compressed UVD factor packet")
+                raise ValueError("iSAM2 backend requires a visual-inertial factor packet")
             isam2_backend = context.get("two_state_isam2_backend")
-            if not isinstance(isam2_backend, IncrementalT2ISAM2Backend):
+            if not isinstance(isam2_backend, IncrementalPACEISAM2Backend):
                 raise RuntimeError("iSAM2 backend was not initialized in optimizer context")
-            isam2_update = isam2_backend.consume(factor_packet)
+            velocity_prior_mean = None
+            velocity_prior_covariance = None
+            near_zero_velocity_detector = context.get(
+                "two_state_near_zero_velocity_detector"
+            )
+            if isinstance(
+                near_zero_velocity_detector,
+                (
+                    TurningNearZeroVelocityDetector,
+                    TurningNearZeroVelocityDetectorV2,
+                ),
+            ):
+                dt_s = float(factor_packet.imu.dt)
+                if isinstance(factor_packet.visual, LinearizedUVDPoseFactor):
+                    visual_relative = pp.SE3(
+                        factor_packet.visual.reference_relative_CjCi
+                    )
+                    extrinsic_ci_lie = pp.SE3(factor_packet.extrinsic_CI)
+                    visual_body_relative = (
+                        extrinsic_ci_lie.Inv()
+                        @ visual_relative
+                        @ extrinsic_ci_lie
+                    )
+                elif isinstance(factor_packet.visual, RelativePoseFactor):
+                    # The detector historically consumes Bj<-Bi. The Pose
+                    # factor stores the optimization measurement Bi<-Bj.
+                    visual_body_relative = pp.SE3(
+                        factor_packet.visual.measurement_BiBj
+                    ).Inv()
+                    visual_relative = visual_body_relative
+                else:
+                    # Full UVD has no fixed pose measurement. Its current
+                    # reference is the MACVO-initialized body motion.
+                    visual_body_relative = (
+                        pp.SE3(factor_packet.state_i_initial.pose_WB).Inv()
+                        @ pp.SE3(factor_packet.state_j_initial.pose_WB)
+                    ).Inv()
+                    visual_relative = visual_body_relative
+                estimated_speed = float(
+                    factor_packet.state_i_initial.velocity_W.norm().item()
+                )
+                visual_body_speed = float(
+                    visual_body_relative.translation().norm().item()
+                ) / dt_s
+                if isinstance(
+                    near_zero_velocity_detector,
+                    TurningNearZeroVelocityDetectorV2,
+                ):
+                    imu = factor_packet.imu
+                    if imu.gravity_world is None or str(
+                        imu.gravity_handling
+                    ) != "residual":
+                        raise ValueError(
+                            "near-zero-velocity detector V2 requires standard "
+                            "local-frame preintegration with residual-side gravity"
+                        )
+                    zero_translation = zero_translation_kinematic_evidence(
+                        pose_WB=factor_packet.state_i_initial.pose_WB,
+                        acc_bias=factor_packet.state_i_initial.acc_bias,
+                        gyro_bias=factor_packet.state_i_initial.gyro_bias,
+                        delta_rotation=imu.delta_rotation,
+                        delta_velocity=imu.delta_velocity,
+                        delta_position=imu.delta_position,
+                        covariance_pvr=imu.covariance,
+                        dt_s=dt_s,
+                        bias_jacobian=imu.bias_jacobian,
+                        linearized_acc_bias=imu.linearized_acc_bias,
+                        linearized_gyro_bias=imu.linearized_gyro_bias,
+                        gravity_world=imu.gravity_world,
+                    )
+                    near_zero_velocity_decision = (
+                        near_zero_velocity_detector.update(
+                            dt_s=dt_s,
+                            estimated_speed_m_s=estimated_speed,
+                            imu_rotvec_body=(
+                                zero_translation.corrected_imu_rotvec_body
+                            ),
+                            visual_rotvec_body=(
+                                visual_body_relative.Inv()
+                                .rotation()
+                                .Log()
+                                .tensor()
+                                .reshape(3)
+                            ),
+                            visual_body_speed_m_s=visual_body_speed,
+                            zero_translation_evidence=zero_translation,
+                        )
+                    )
+                else:
+                    imu_delta_rotation = (
+                        factor_packet.imu.delta_rotation.reshape(-1)
+                    )
+                    if int(imu_delta_rotation.numel()) == 4:
+                        imu_rotation_angle = float(
+                            pp.SO3(imu_delta_rotation.reshape(1, 4))
+                            .Log()
+                            .tensor()
+                            .reshape(3)
+                            .norm()
+                            .item()
+                        )
+                    else:
+                        imu_rotation_angle = float(
+                            imu_delta_rotation.reshape(3).norm().item()
+                        )
+                    visual_rotation_angle = float(
+                        visual_relative.rotation()
+                        .Log()
+                        .tensor()
+                        .reshape(3)
+                        .norm()
+                        .item()
+                    )
+                    near_zero_velocity_decision = (
+                        near_zero_velocity_detector.update(
+                            dt_s=dt_s,
+                            estimated_speed_m_s=estimated_speed,
+                            imu_angular_rate_rad_s=imu_rotation_angle / dt_s,
+                            visual_angular_rate_rad_s=(
+                                visual_rotation_angle / dt_s
+                            ),
+                            visual_body_speed_m_s=visual_body_speed,
+                        )
+                    )
+                context["two_state_near_zero_velocity_last_decision"] = (
+                    near_zero_velocity_decision
+                )
+                if near_zero_velocity_decision.active:
+                    prior_std = float(
+                        context["two_state_near_zero_velocity_prior_std_m_s"]
+                    )
+                    if not math.isfinite(prior_std) or prior_std <= 0.0:
+                        raise ValueError(
+                            "two_state_near_zero_velocity_prior_std_m_s "
+                            "must be finite and positive"
+                        )
+                    velocity_prior_mean = torch.zeros(
+                        3, dtype=torch.float64
+                    )
+                    velocity_prior_covariance = (
+                        torch.eye(3, dtype=torch.float64)
+                        * prior_std
+                        * prior_std
+                    )
+            isam2_update = isam2_backend.consume(
+                factor_packet,
+                velocity_prior_mean_W=velocity_prior_mean,
+                velocity_prior_covariance_W=velocity_prior_covariance,
+            )
             state_i_result = isam2_update.previous_state.to(device=device, dtype=dtype)
             state_j_result = isam2_update.state.to(device=device, dtype=dtype)
             state_step = state_boxminus(
@@ -3868,6 +4146,9 @@ class TwoFrame_PGO(IOptimizer[GraphInput, dict, GraphOutput]):
                 imu_cost=float(isam2_update.imu_cost),
                 bias_cost=float(isam2_update.bias_cost),
                 visual_pose_cost=float(isam2_update.visual_cost),
+                velocity_prior_cost=float(
+                    isam2_update.velocity_prior_cost
+                ),
                 final_step_norm=float(torch.linalg.vector_norm(state_step).item()),
                 final_gradient_inf_norm=0.0,
                 convergence_reason="isam2_incremental_update",
@@ -3920,7 +4201,11 @@ class TwoFrame_PGO(IOptimizer[GraphInput, dict, GraphOutput]):
                 torch.linalg.vector_norm(post_white).item()
             )
 
-        if visual_factor_mode == "relative_pose" and not str(visual_gate["action"]).startswith("reject:"):
+        if (
+            backend_name != "isam2"
+            and visual_factor_mode == "relative_pose"
+            and not str(visual_gate["action"]).startswith("reject:")
+        ):
             gate_config = context["two_state_visual_gate"]
             additional_inflation = 1.0
             post_action = None
@@ -4257,6 +4542,141 @@ class TwoFrame_PGO(IOptimizer[GraphInput, dict, GraphOutput]):
             two_state_final_gradient_inf_norm=result.final_gradient_inf_norm,
             two_state_solver_accepted_steps=result.accepted_steps,
             two_state_solver_rejected_steps=result.rejected_steps,
+            near_zero_velocity_enabled=(
+                context.get("two_state_near_zero_velocity_detector") is not None
+            ),
+            near_zero_velocity_detector_version=(
+                str(context["two_state_near_zero_velocity_detector_version"])
+                if near_zero_velocity_decision is not None
+                else "disabled"
+            ),
+            near_zero_velocity_candidate=(
+                near_zero_velocity_decision.candidate
+                if near_zero_velocity_decision is not None
+                else False
+            ),
+            near_zero_velocity_active=(
+                near_zero_velocity_decision.active
+                if near_zero_velocity_decision is not None
+                else False
+            ),
+            near_zero_velocity_entered=(
+                near_zero_velocity_decision.entered
+                if near_zero_velocity_decision is not None
+                else False
+            ),
+            near_zero_velocity_exited=(
+                near_zero_velocity_decision.exited
+                if near_zero_velocity_decision is not None
+                else False
+            ),
+            near_zero_velocity_estimated_speed_m_s=(
+                near_zero_velocity_decision.estimated_speed_m_s
+                if near_zero_velocity_decision is not None
+                else None
+            ),
+            near_zero_velocity_imu_angular_rate_rad_s=(
+                near_zero_velocity_decision.imu_angular_rate_rad_s
+                if near_zero_velocity_decision is not None
+                else None
+            ),
+            near_zero_velocity_visual_angular_rate_rad_s=(
+                near_zero_velocity_decision.visual_angular_rate_rad_s
+                if near_zero_velocity_decision is not None
+                else None
+            ),
+            near_zero_velocity_visual_body_speed_m_s=(
+                near_zero_velocity_decision.visual_body_speed_m_s
+                if near_zero_velocity_decision is not None
+                else None
+            ),
+            near_zero_velocity_angular_rate_disagreement_rad_s=(
+                getattr(
+                    near_zero_velocity_decision,
+                    "angular_rate_disagreement_rad_s",
+                    None,
+                )
+                if near_zero_velocity_decision is not None
+                else None
+            ),
+            near_zero_velocity_rotation_vector_rate_difference_rad_s=(
+                getattr(
+                    near_zero_velocity_decision,
+                    "rotation_vector_rate_difference_rad_s",
+                    None,
+                )
+                if near_zero_velocity_decision is not None
+                else None
+            ),
+            near_zero_velocity_rotation_axis_cosine=(
+                getattr(
+                    near_zero_velocity_decision,
+                    "rotation_axis_cosine",
+                    None,
+                )
+                if near_zero_velocity_decision is not None
+                else None
+            ),
+            near_zero_velocity_zero_translation_nis=(
+                getattr(
+                    near_zero_velocity_decision,
+                    "zero_translation_nis",
+                    None,
+                )
+                if near_zero_velocity_decision is not None
+                else None
+            ),
+            near_zero_velocity_zero_translation_dof=(
+                getattr(
+                    near_zero_velocity_decision,
+                    "zero_translation_dof",
+                    None,
+                )
+                if near_zero_velocity_decision is not None
+                else None
+            ),
+            near_zero_velocity_zero_translation_nis_per_dof=(
+                getattr(
+                    near_zero_velocity_decision,
+                    "zero_translation_nis_per_dof",
+                    None,
+                )
+                if near_zero_velocity_decision is not None
+                else None
+            ),
+            near_zero_velocity_zero_translation_position_residual_norm_m=(
+                getattr(
+                    near_zero_velocity_decision,
+                    "zero_translation_position_residual_norm_m",
+                    None,
+                )
+                if near_zero_velocity_decision is not None
+                else None
+            ),
+            near_zero_velocity_zero_translation_velocity_residual_norm_m_s=(
+                getattr(
+                    near_zero_velocity_decision,
+                    "zero_translation_velocity_residual_norm_m_s",
+                    None,
+                )
+                if near_zero_velocity_decision is not None
+                else None
+            ),
+            near_zero_velocity_reason=(
+                near_zero_velocity_decision.reason
+                if near_zero_velocity_decision is not None
+                else "disabled"
+            ),
+            near_zero_velocity_prior_std_m_s=(
+                float(context["two_state_near_zero_velocity_prior_std_m_s"])
+                if near_zero_velocity_decision is not None
+                else None
+            ),
+            near_zero_velocity_prior_cost=(
+                float(isam2_update.velocity_prior_cost)
+                if isam2_update is not None
+                else None
+            ),
             vio_backend=backend_name,
             isam2_update_ms=(
                 float(isam2_update.update_ms) if isam2_update is not None else None
@@ -4980,6 +5400,55 @@ class TwoFrame_PGO(IOptimizer[GraphInput, dict, GraphOutput]):
             "isam2_initial_bias_mismatch_norm": (
                 result.isam2_initial_bias_mismatch_norm
             ),
+            "near_zero_velocity_enabled": result.near_zero_velocity_enabled,
+            "near_zero_velocity_detector_version": (
+                result.near_zero_velocity_detector_version
+            ),
+            "near_zero_velocity_candidate": result.near_zero_velocity_candidate,
+            "near_zero_velocity_active": result.near_zero_velocity_active,
+            "near_zero_velocity_entered": result.near_zero_velocity_entered,
+            "near_zero_velocity_exited": result.near_zero_velocity_exited,
+            "near_zero_velocity_estimated_speed_m_s": (
+                result.near_zero_velocity_estimated_speed_m_s
+            ),
+            "near_zero_velocity_imu_angular_rate_rad_s": (
+                result.near_zero_velocity_imu_angular_rate_rad_s
+            ),
+            "near_zero_velocity_visual_angular_rate_rad_s": (
+                result.near_zero_velocity_visual_angular_rate_rad_s
+            ),
+            "near_zero_velocity_visual_body_speed_m_s": (
+                result.near_zero_velocity_visual_body_speed_m_s
+            ),
+            "near_zero_velocity_angular_rate_disagreement_rad_s": (
+                result.near_zero_velocity_angular_rate_disagreement_rad_s
+            ),
+            "near_zero_velocity_rotation_vector_rate_difference_rad_s": (
+                result.near_zero_velocity_rotation_vector_rate_difference_rad_s
+            ),
+            "near_zero_velocity_rotation_axis_cosine": (
+                result.near_zero_velocity_rotation_axis_cosine
+            ),
+            "near_zero_velocity_zero_translation_nis": (
+                result.near_zero_velocity_zero_translation_nis
+            ),
+            "near_zero_velocity_zero_translation_dof": (
+                result.near_zero_velocity_zero_translation_dof
+            ),
+            "near_zero_velocity_zero_translation_nis_per_dof": (
+                result.near_zero_velocity_zero_translation_nis_per_dof
+            ),
+            "near_zero_velocity_zero_translation_position_residual_norm_m": (
+                result.near_zero_velocity_zero_translation_position_residual_norm_m
+            ),
+            "near_zero_velocity_zero_translation_velocity_residual_norm_m_s": (
+                result.near_zero_velocity_zero_translation_velocity_residual_norm_m_s
+            ),
+            "near_zero_velocity_reason": result.near_zero_velocity_reason,
+            "near_zero_velocity_prior_std_m_s": (
+                result.near_zero_velocity_prior_std_m_s
+            ),
+            "near_zero_velocity_prior_cost": result.near_zero_velocity_prior_cost,
         }
         for field_name in (
             "imu_vio_sa_v2_prior_reset",
@@ -5167,6 +5636,55 @@ class TwoFrame_PGO(IOptimizer[GraphInput, dict, GraphOutput]):
             "imu_residual_rows": result.imu_residual_rows,
             "use_imu_rotation": result.use_imu_rotation,
             "use_imu_translation": result.use_imu_translation,
+            "near_zero_velocity_enabled": result.near_zero_velocity_enabled,
+            "near_zero_velocity_detector_version": (
+                result.near_zero_velocity_detector_version
+            ),
+            "near_zero_velocity_candidate": result.near_zero_velocity_candidate,
+            "near_zero_velocity_active": result.near_zero_velocity_active,
+            "near_zero_velocity_entered": result.near_zero_velocity_entered,
+            "near_zero_velocity_exited": result.near_zero_velocity_exited,
+            "near_zero_velocity_estimated_speed_m_s": (
+                result.near_zero_velocity_estimated_speed_m_s
+            ),
+            "near_zero_velocity_imu_angular_rate_rad_s": (
+                result.near_zero_velocity_imu_angular_rate_rad_s
+            ),
+            "near_zero_velocity_visual_angular_rate_rad_s": (
+                result.near_zero_velocity_visual_angular_rate_rad_s
+            ),
+            "near_zero_velocity_visual_body_speed_m_s": (
+                result.near_zero_velocity_visual_body_speed_m_s
+            ),
+            "near_zero_velocity_angular_rate_disagreement_rad_s": (
+                result.near_zero_velocity_angular_rate_disagreement_rad_s
+            ),
+            "near_zero_velocity_rotation_vector_rate_difference_rad_s": (
+                result.near_zero_velocity_rotation_vector_rate_difference_rad_s
+            ),
+            "near_zero_velocity_rotation_axis_cosine": (
+                result.near_zero_velocity_rotation_axis_cosine
+            ),
+            "near_zero_velocity_zero_translation_nis": (
+                result.near_zero_velocity_zero_translation_nis
+            ),
+            "near_zero_velocity_zero_translation_dof": (
+                result.near_zero_velocity_zero_translation_dof
+            ),
+            "near_zero_velocity_zero_translation_nis_per_dof": (
+                result.near_zero_velocity_zero_translation_nis_per_dof
+            ),
+            "near_zero_velocity_zero_translation_position_residual_norm_m": (
+                result.near_zero_velocity_zero_translation_position_residual_norm_m
+            ),
+            "near_zero_velocity_zero_translation_velocity_residual_norm_m_s": (
+                result.near_zero_velocity_zero_translation_velocity_residual_norm_m_s
+            ),
+            "near_zero_velocity_reason": result.near_zero_velocity_reason,
+            "near_zero_velocity_prior_std_m_s": (
+                result.near_zero_velocity_prior_std_m_s
+            ),
+            "near_zero_velocity_prior_cost": result.near_zero_velocity_prior_cost,
         }
         for field_name in (
             "imu_vio_sa_v2_sampling_noise_cost",

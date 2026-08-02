@@ -23,6 +23,7 @@ using gtsam::symbol_shorthand::V;
 using gtsam::symbol_shorthand::X;
 using t2_isam2::T2CachedImuFactor;
 using t2_isam2::T2CompressedVisualFactor;
+using t2_isam2::T2DirectUVDPointFactor;
 
 double max_abs(const Matrix& matrix) {
   return matrix.size() == 0 ? 0.0 : matrix.cwiseAbs().maxCoeff();
@@ -61,7 +62,57 @@ void test_visual_jacobian() {
           "compressed visual analytic Jacobian differs from central difference");
 }
 
-void test_imu_residual_and_zero_blocks() {
+Vector3 project_uvd(
+    const Point3& point, const Eigen::Matrix3d& intrinsic,
+    double baseline) {
+  Vector3 result;
+  result << intrinsic(0, 0) * point.y() / point.x() + intrinsic(0, 2),
+      intrinsic(1, 1) * point.z() / point.x() + intrinsic(1, 2),
+      intrinsic(0, 0) * baseline / point.x();
+  return result;
+}
+
+void test_direct_uvd_jacobian() {
+  const Pose3 pose_i(
+      Rot3::RzRyRx(0.07, -0.04, 0.12), Point3(0.2, -0.1, 0.5));
+  const Pose3 pose_j(
+      Rot3::RzRyRx(0.03, 0.01, 0.16), Point3(0.35, -0.04, 0.48));
+  const Pose3 extrinsic(
+      Rot3::RzRyRx(0.01, -0.02, 0.03), Point3(0.12, -0.03, 0.08));
+  const Point3 point_Ci(4.0, 0.5, -0.2);
+  Eigen::Matrix3d intrinsic = Eigen::Matrix3d::Identity();
+  intrinsic(0, 0) = 320.0;
+  intrinsic(1, 1) = 318.0;
+  intrinsic(0, 2) = 320.0;
+  intrinsic(1, 2) = 240.0;
+  const double baseline = 0.225;
+  const Pose3 current = pose_j.compose(extrinsic.inverse()).between(
+      pose_i.compose(extrinsic.inverse()));
+  const Vector3 target = project_uvd(
+      current.transformFrom(point_Ci), intrinsic, baseline) +
+      Vector3(0.3, -0.2, 0.1);
+  T2DirectUVDPointFactor factor(
+      X(0), X(1), point_Ci, target, intrinsic, baseline, extrinsic,
+      gtsam::noiseModel::Unit::Create(3));
+
+  Matrix H_i, H_j;
+  factor.evaluateError(pose_i, pose_j, H_i, H_j);
+  const auto function = [&factor](const Pose3& first, const Pose3& second) {
+    return factor.evaluateError(first, second);
+  };
+  const Matrix numerical_i = gtsam::numericalDerivative21(
+      function, pose_i, pose_j, 1.0e-6);
+  const Matrix numerical_j = gtsam::numericalDerivative22(
+      function, pose_i, pose_j, 1.0e-6);
+  const double error_i = max_abs(H_i - numerical_i);
+  const double error_j = max_abs(H_j - numerical_j);
+  std::cout << "direct UVD Jacobian max abs i/j: "
+            << error_i << " / " << error_j << '\n';
+  require(error_i < 1.0e-5 && error_j < 1.0e-5,
+          "direct UVD analytic Jacobian differs from central difference");
+}
+
+void test_imu_residual_and_jacobians() {
   const Pose3 pose_i(Rot3::RzRyRx(0.12, -0.07, 0.18), Point3(0.3, -0.4, 0.8));
   const Rot3 delta_rotation = Rot3::Expmap(Vector3(0.02, -0.01, 0.03));
   const Pose3 relative(delta_rotation, Point3(0.07, -0.02, 0.01));
@@ -70,23 +121,60 @@ void test_imu_residual_and_zero_blocks() {
   const Vector3 velocity_j(0.43, -0.08, 0.19);
   const ConstantBias bias(Vector3(0.01, -0.02, 0.03), Vector3(0.001, -0.002, 0.003));
   const double dt = 0.1;
-  const Vector3 gravity_world = Vector3::Zero();
-  const Vector3 delta_p = relative.translation() - pose_i.rotation().unrotate(velocity_i) * dt;
-  const Vector3 delta_v = pose_i.rotation().unrotate(velocity_j - velocity_i);
+  const Vector3 gravity_world(0.0, 0.0, 9.8);
+  const Vector3 gravity_body = pose_i.rotation().unrotate(gravity_world);
+  const Vector3 delta_p = relative.translation() -
+      pose_i.rotation().unrotate(velocity_i) * dt -
+      0.5 * gravity_body * dt * dt;
+  const Vector3 delta_v = pose_i.rotation().unrotate(velocity_j - velocity_i) -
+      gravity_body * dt;
   const Matrix9 covariance = Matrix9::Identity();
-  const Eigen::Matrix<double, 9, 6> bias_jacobian = Eigen::Matrix<double, 9, 6>::Zero();
+  Eigen::Matrix<double, 9, 6> bias_jacobian =
+      Eigen::Matrix<double, 9, 6>::Zero();
+  bias_jacobian.block<3, 3>(0, 0) = -0.005 * Eigen::Matrix3d::Identity();
+  bias_jacobian.block<3, 3>(3, 0) = -0.1 * Eigen::Matrix3d::Identity();
+  bias_jacobian.block<3, 3>(6, 3) = -0.1 * Eigen::Matrix3d::Identity();
+  const ConstantBias linearized_bias(
+      bias.accelerometer() + Vector3(0.002, -0.001, 0.003),
+      bias.gyroscope() + Vector3(-0.0002, 0.0001, 0.0003));
   T2CachedImuFactor factor(
       X(0), V(0), B(0), X(1), V(1), delta_rotation, delta_v, delta_p,
-      dt, covariance, bias_jacobian, bias.accelerometer(), bias.gyroscope(),
+      dt, covariance, bias_jacobian, linearized_bias.accelerometer(),
+      linearized_bias.gyroscope(),
       gravity_world, true, 1.0e-6);
 
   Matrix H_xi, H_vi, H_bi, H_xj, H_vj;
-  const Vector residual = factor.evaluateError(
+  factor.evaluateError(
       pose_i, velocity_i, bias, pose_j, velocity_j,
       H_xi, H_vi, H_bi, H_xj, H_vj);
-  require(max_abs(residual) < 1.0e-10, "synthetic cached IMU residual does not close");
   require(H_xi.allFinite() && H_vi.allFinite() && H_bi.allFinite() &&
           H_xj.allFinite() && H_vj.allFinite(), "cached IMU Jacobian contains NaN/Inf");
+
+  const auto function = [&factor](
+      const Pose3& first_pose, const Vector3& first_velocity,
+      const ConstantBias& first_bias, const Pose3& second_pose,
+      const Vector3& second_velocity) {
+    return factor.evaluateError(
+        first_pose, first_velocity, first_bias, second_pose, second_velocity);
+  };
+  const double epsilon = 1.0e-6;
+  const Matrix numerical_xi = gtsam::numericalDerivative51(
+      function, pose_i, velocity_i, bias, pose_j, velocity_j, epsilon);
+  const Matrix numerical_vi = gtsam::numericalDerivative52(
+      function, pose_i, velocity_i, bias, pose_j, velocity_j, epsilon);
+  const Matrix numerical_bi = gtsam::numericalDerivative53(
+      function, pose_i, velocity_i, bias, pose_j, velocity_j, epsilon);
+  const Matrix numerical_xj = gtsam::numericalDerivative54(
+      function, pose_i, velocity_i, bias, pose_j, velocity_j, epsilon);
+  const Matrix numerical_vj = gtsam::numericalDerivative55(
+      function, pose_i, velocity_i, bias, pose_j, velocity_j, epsilon);
+  const double jacobian_error = std::max({
+      max_abs(H_xi - numerical_xi), max_abs(H_vi - numerical_vi),
+      max_abs(H_bi - numerical_bi), max_abs(H_xj - numerical_xj),
+      max_abs(H_vj - numerical_vj)});
+  std::cout << "IMU Jacobian max abs: " << jacobian_error << '\n';
+  require(jacobian_error < 1.0e-6,
+          "cached IMU analytic Jacobian differs from central difference");
 
   const double rp_phi_j = max_abs(H_xj.block(0, 0, 3, 3));
   const double rv_pose_j = max_abs(H_xj.block(3, 0, 3, 6));
@@ -100,8 +188,9 @@ void test_imu_residual_and_zero_blocks() {
 int main() {
   try {
     test_visual_jacobian();
-    test_imu_residual_and_zero_blocks();
-    std::cout << "T2-iSAM2 factor tests passed\n";
+    test_direct_uvd_jacobian();
+    test_imu_residual_and_jacobians();
+    std::cout << "PACE-VIO iSAM2 factor tests passed\n";
     return 0;
   } catch (const std::exception& error) {
     std::cerr << "test failure: " << error.what() << '\n';

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run stereo + raw IMU through the validated online MACVO T2 pipeline."""
+"""Run stereo + raw IMU through the validated online PACE-VIO pipeline."""
 
 from __future__ import annotations
 
@@ -21,7 +21,7 @@ import yaml
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
-BASE_ODOM = ROOT / "Config/Experiment/MACVO/MACVO_Realtime_T2.yaml"
+BASE_ODOM = ROOT / "Config/Experiment/MACVO/PACE_VIO_Realtime.yaml"
 BASE_SEQUENCE = ROOT / "Config/Sequence/realtime_stereo_imu.yaml"
 DEFAULT_MODEL = ROOT / "Model/MACVO_FrontendCov.pth"
 
@@ -62,7 +62,7 @@ def validate_dataset(dataset: Path) -> dict[str, Path]:
     metadata = dataset / "metadata.json"
     if not metadata.is_file():
         raise FileNotFoundError(
-            f"Missing {metadata}. T2 requires metadata for camera, IMU noise, "
+            f"Missing {metadata}. PACE-VIO requires metadata for camera, IMU noise, "
             "time and camera/IMU extrinsic contracts."
         )
     imu = dataset / "imu_data.csv"
@@ -88,6 +88,9 @@ def configure_odom(
     static_stable_hold_s: float,
     cpu_threads: int,
     vio_backend: str,
+    visual_factor: str,
+    near_zero_velocity_detector: str,
+    near_zero_velocity_prior_std_m_s: float,
 ) -> None:
     cfg = load_yaml(BASE_ODOM)
     args = cfg["Odometry"]["args"]
@@ -109,6 +112,33 @@ def configure_odom(
     optimizer["parallel"] = bool(parallel)
     optimizer["two_state_cpu_threads"] = int(cpu_threads)
     optimizer["two_state_backend"] = str(vio_backend)
+    optimizer["two_state_visual_factor_mode"] = {
+        "pose": "relative_pose",
+        "uvd": "direct_uvd",
+        "pace": "compressed_uvd",
+    }[str(visual_factor)]
+    optimizer["two_state_near_zero_velocity_enable"] = (
+        near_zero_velocity_detector != "off"
+    )
+    if near_zero_velocity_detector != "off":
+        optimizer["two_state_near_zero_velocity_detector_version"] = str(
+            near_zero_velocity_detector
+        )
+        optimizer["two_state_near_zero_velocity_prior_std_m_s"] = float(
+            near_zero_velocity_prior_std_m_s
+        )
+    if near_zero_velocity_detector == "v2":
+        optimizer.update(
+            {
+                "two_state_near_zero_velocity_v2_minimum_imu_angular_rate_rad_s": 0.30,
+                "two_state_near_zero_velocity_v2_minimum_visual_angular_rate_rad_s": 0.25,
+                "two_state_near_zero_velocity_v2_maximum_rotation_vector_rate_difference_rad_s": 0.08,
+                "two_state_near_zero_velocity_v2_minimum_rotation_axis_cosine": 0.90,
+                "two_state_near_zero_velocity_v2_maximum_zero_translation_nis_per_dof": 3.5,
+                "two_state_near_zero_velocity_enter_hold_s": 0.20,
+                "two_state_near_zero_velocity_release_hold_s": 0.10,
+            }
+        )
     write_yaml(target, cfg)
 
 
@@ -169,7 +199,7 @@ def validate_static_initialization_options(args: argparse.Namespace) -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset", type=Path, required=True)
-    parser.add_argument("--output", type=Path, default=ROOT / "Results/realtime_t2")
+    parser.add_argument("--output", type=Path, default=ROOT / "Results/pace_vio")
     parser.add_argument("--model", type=Path, default=DEFAULT_MODEL)
     parser.add_argument("--mode", choices=("pipeline", "serial"), default="pipeline")
     parser.add_argument("--seq-from", type=int, default=0)
@@ -209,9 +239,34 @@ def parse_args() -> argparse.Namespace:
         choices=("two_state", "isam2"),
         default="two_state",
         help=(
-            "two_state preserves the validated online T2 solver; isam2 consumes "
-            "the same compressed-UVD/IMU/bias factor packets incrementally"
+            "Select the two-state or incremental iSAM2 backend. Both accept Pose, "
+            "point-level UVD and PACE visual factors."
         ),
+    )
+    parser.add_argument(
+        "--visual-factor",
+        choices=("pose", "uvd", "pace"),
+        default="pace",
+        help=(
+            "Visual representation: robust relative Pose, native point-level UVD, "
+            "or the compressed PACE factor (default)."
+        ),
+    )
+    parser.add_argument(
+        "--near-zero-velocity-detector",
+        choices=("off", "v1", "v2"),
+        default="off",
+        help=(
+            "Opt-in causal turn-stop velocity factor. The production default "
+            "remains off; v2 uses IMU/visual rotation agreement and local "
+            "zero-translation NIS."
+        ),
+    )
+    parser.add_argument(
+        "--near-zero-velocity-prior-std-m-s",
+        type=float,
+        default=0.01,
+        help="Per-axis velocity prior standard deviation when the detector is active.",
     )
     parser.add_argument("--timeout", type=int, default=21600)
     parser.add_argument(
@@ -221,6 +276,28 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--dashboard-host", default="127.0.0.1")
     parser.add_argument("--dashboard-port", type=int, default=8765)
+    parser.add_argument(
+        "--paper-evaluation",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "After a successful run, export full-sequence APE/RPE, timing, "
+            "solver and detector outputs when ref_pose.csv is available."
+        ),
+    )
+    parser.add_argument(
+        "--evaluation-alignment-json",
+        type=Path,
+        help=(
+            "Optional explicit fixed time/SE(3) evaluation contract. Scale must "
+            "remain one; omitted for synchronized HoloOcean sequences."
+        ),
+    )
+    parser.add_argument(
+        "--motion-reference-csv",
+        type=Path,
+        help="Optional per-edge reference labels for detector confusion statistics.",
+    )
     parser.add_argument(
         "--dry-run",
         action="store_true",
@@ -240,15 +317,24 @@ def main() -> int:
     validate_static_initialization_options(args)
     if args.cpu_threads < 1:
         raise ValueError("--cpu-threads must be >= 1")
+    if args.near_zero_velocity_prior_std_m_s <= 0.0:
+        raise ValueError("--near-zero-velocity-prior-std-m-s must be > 0")
+    if (
+        args.near_zero_velocity_detector != "off"
+        and args.vio_backend != "isam2"
+    ):
+        raise ValueError(
+            "--near-zero-velocity-detector currently requires --vio-backend isam2"
+        )
     if not args.dry_run and not model.is_file():
         raise FileNotFoundError(
             f"Missing frontend model: {model}\n"
             "Run: python Scripts/download_models.py"
         )
     if args.vio_backend == "isam2":
-        from Utility.T2ISAM2Backend import IncrementalT2ISAM2Backend
+        from Utility.PACEISAM2Backend import IncrementalPACEISAM2Backend
 
-        IncrementalT2ISAM2Backend(
+        IncrementalPACEISAM2Backend(
             initial_prior_std={
                 "pose_translation_std": 1.0e-5,
                 "pose_rotation_std": 1.0e-5,
@@ -278,6 +364,11 @@ def main() -> int:
         static_stable_hold_s=args.static_init_stable_hold_s,
         cpu_threads=args.cpu_threads,
         vio_backend=args.vio_backend,
+        visual_factor=args.visual_factor,
+        near_zero_velocity_detector=args.near_zero_velocity_detector,
+        near_zero_velocity_prior_std_m_s=(
+            args.near_zero_velocity_prior_std_m_s
+        ),
     )
     configure_sequence(sequence_path, dataset, fmt)
 
@@ -287,7 +378,14 @@ def main() -> int:
         "dataset": str(dataset),
         "mode": args.mode,
         "frontend": "live MACVO stereo frontend (no visual cache)",
-        "backend": f"{args.vio_backend} + compressed_uvd T2 factor packets",
+        "project": "PACE-VIO",
+        "backend": args.vio_backend,
+        "visual_factor": args.visual_factor,
+        "near_zero_velocity": {
+            "detector": args.near_zero_velocity_detector,
+            "prior_std_m_s": args.near_zero_velocity_prior_std_m_s,
+            "production_default": "off",
+        },
         "preintegration": "standard_local_frame_preintegration",
         "trajectory_reference": "IMU center for VIO output",
         "frame_contract": {
@@ -312,6 +410,20 @@ def main() -> int:
             "adaptive_stable_hold_s": args.static_init_stable_hold_s,
         },
         "ground_truth_available": optional_ref.is_file(),
+        "paper_evaluation": {
+            "enabled": bool(args.paper_evaluation),
+            "sequence_scope": "complete active sequence",
+            "alignment_json": (
+                None
+                if args.evaluation_alignment_json is None
+                else str(args.evaluation_alignment_json.expanduser().resolve())
+            ),
+            "motion_reference_csv": (
+                None
+                if args.motion_reference_csv is None
+                else str(args.motion_reference_csv.expanduser().resolve())
+            ),
+        },
         "input_sha256": {name: sha256(path) for name, path in inputs.items()},
     }
     if optional_ref.is_file():
@@ -349,6 +461,7 @@ def main() -> int:
     print(f"Output:  {result_root}")
     print(f"Mode:    {args.mode}")
     print(f"Backend: {args.vio_backend}")
+    print(f"Factor:  {args.visual_factor}")
     print(f"Command: {shlex.join(command)}", flush=True)
     if args.live_display:
         print(f"Dashboard: http://{args.dashboard_host}:{args.dashboard_port}/", flush=True)
@@ -374,6 +487,44 @@ def main() -> int:
         raise
     elapsed = time.monotonic() - started
     status = "ok" if return_code == 0 else "failed"
+    (result_root / "run_execution.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "process_wall_runtime_s": elapsed,
+                "return_code": int(return_code),
+                "mode": args.mode,
+                "seq_from": args.seq_from,
+                "seq_to": args.seq_to,
+                "startup_and_initialization_included": True,
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    if return_code == 0 and args.paper_evaluation:
+        if optional_ref.is_file():
+            from Utility.PaperEvaluation import export_paper_evaluation
+
+            try:
+                evaluation_dir = export_paper_evaluation(
+                    project_root=ROOT,
+                    dataset_root=dataset,
+                    result_root=result_root,
+                    alignment_path=args.evaluation_alignment_json,
+                    motion_reference_path=args.motion_reference_csv,
+                )
+                print(f"Paper evaluation: {evaluation_dir}", flush=True)
+            except Exception as error:
+                status = "evaluation_failed"
+                return_code = 2
+                print(f"Paper evaluation failed: {error}", file=sys.stderr, flush=True)
+        else:
+            print(
+                "Paper evaluation skipped: dataset has no ref_pose.csv.",
+                flush=True,
+            )
     append_progress(
         output / "progress.csv",
         {

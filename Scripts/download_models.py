@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Download and verify the only pretrained model used by realtime T2."""
+"""Download and verify the only pretrained model used by PACE-VIO."""
 
 from __future__ import annotations
 

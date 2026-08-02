@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fail-fast check for the realtime T2 Python/CUDA/model environment."""
+"""Fail-fast check for the PACE-VIO Python/CUDA/model environment."""
 
 from __future__ import annotations
 
@@ -30,6 +30,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", type=Path, default=ROOT / "Model/MACVO_FrontendCov.pth")
     parser.add_argument("--skip-model", action="store_true")
+    parser.add_argument("--require-isam2", action="store_true")
     args = parser.parse_args()
 
     if sys.version_info < (3, 10):
@@ -61,6 +62,12 @@ def main() -> int:
     for module in ("DataLoader", "Module", "Odometry.MACVO", "Utility.TwoStateVIO", "Utility.LiveDashboard"):
         importlib.import_module(module)
 
+    if args.require_isam2:
+        from Utility.T2ISAM2Backend import _load_extension
+
+        extension = _load_extension()
+        versions["isam2_extension"] = str(extension.__file__)
+
     if not args.skip_model:
         model = args.model.expanduser().resolve()
         if not model.is_file():
@@ -69,7 +76,7 @@ def main() -> int:
         if current != MODEL_SHA256:
             raise RuntimeError(f"Model SHA-256 {current}, expected {MODEL_SHA256}")
 
-    print("Realtime T2 runtime check passed")
+    print("PACE-VIO runtime check passed")
     for key, value in versions.items():
         print(f"  {key}: {value}")
     return 0

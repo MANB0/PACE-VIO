@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Export archived T2 factors for the standalone C++ iSAM2 backend.
+"""Export archived PACE factors for the standalone C++ iSAM2 backend.
 
 The bundle preserves the production optimizer's internal NED/IMU-centre
 contract.  It contains no ground truth and does not modify the source tensor
@@ -246,7 +246,7 @@ def write_edges(path: Path, archive) -> None:
         rows.append(values)
 
     if header is None:
-        raise RuntimeError("cannot export an empty T2 edge range")
+        raise RuntimeError("cannot export an empty PACE-VIO edge range")
     with path.open("w", newline="", encoding="utf-8") as stream:
         writer = csv.writer(stream)
         writer.writerow(header)

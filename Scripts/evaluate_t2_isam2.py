@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare the isolated T2-iSAM2 prototype with existing T2 estimates."""
+"""Compare the isolated PACE-VIO-iSAM2 prototype with PACE-VIO-2S estimates."""
 
 from __future__ import annotations
 
@@ -155,9 +155,9 @@ def write_plot(
         "GT": (gt - gt[0], "#111827"),
     }
     colors = {
-        "Online T2": "#dc2626",
+        "Online PACE-VIO-2S": "#dc2626",
         "Python full-history 15D": "#2563eb",
-        "T2-iSAM2": "#059669",
+        "PACE-VIO-iSAM2": "#059669",
     }
     for name, frame in estimates.items():
         points = frame[["tx_nwu", "ty_nwu", "tz_nwu"]].to_numpy(np.float64)
@@ -178,7 +178,7 @@ def write_plot(
         axis.axis("equal")
         axis.grid(alpha=0.25)
     axes[0].legend(fontsize=8)
-    fig.suptitle("T2 solver comparison, frames 90-299, IMU center")
+    fig.suptitle("PACE-VIO solver comparison, frames 90-299, IMU center")
     fig.savefig(output / "t2_isam2_vs_existing.png", dpi=180)
     plt.close(fig)
 
@@ -218,9 +218,9 @@ def main() -> None:
     )
 
     estimates = {
-        "Online T2": online,
+        "Online PACE-VIO-2S": online,
         "Python full-history 15D": history,
-        "T2-iSAM2": isam2,
+        "PACE-VIO-iSAM2": isam2,
     }
     metrics = [
         evaluate_method(

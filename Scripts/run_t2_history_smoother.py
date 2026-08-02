@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the read-only T2 full-history smoother on a production tensor archive."""
+"""Run the read-only PACE-VIO full-history smoother on an archive."""
 
 from __future__ import annotations
 

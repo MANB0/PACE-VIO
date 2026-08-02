@@ -13,31 +13,15 @@ import matplotlib.pyplot as plt
 from scipy.spatial.transform import Rotation
 
 
-DATASET_DEFAULT = Path(
-    "/mnt/e/文档/holoocean/code/recordings/"
-    "batch_clear_truth_paths_20260713_static63_variants/"
-    "clear_circle_truth_normal_noise"
-)
-BASELINE_DEFAULT = Path(
-    "/home/admin1/macvo-dev/Results/"
-    "normal_noise_compressed_uvd_t2_full_three_scenes_20260720/"
-    "trial_1/vio_two_state_compressed_uvd_t2_full/"
-    "clear_circle_truth_normal_noise/poses_imu.csv"
-)
-ZERO_ROOT_DEFAULT = Path(
-    "/home/admin1/macvo-realtime-t2-minimal/Results/"
-    "zero_init_circle_full_final_20260721/clear_circle_truth_normal_noise"
-)
-OUTPUT_DEFAULT = Path(
-    "/home/admin1/macvo-realtime-t2-minimal/"
-    "analysis_circle_zero_initialization_ablation_20260721"
-)
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+ZERO_ROOT_DEFAULT = PROJECT_ROOT / "Results" / "zero_init_circle"
+OUTPUT_DEFAULT = PROJECT_ROOT / "Results" / "zero_init_circle_analysis"
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--dataset", type=Path, default=DATASET_DEFAULT)
-    parser.add_argument("--baseline", type=Path, default=BASELINE_DEFAULT)
+    parser.add_argument("--dataset", type=Path, required=True)
+    parser.add_argument("--baseline", type=Path, required=True)
     parser.add_argument("--zero-root", type=Path, default=ZERO_ROOT_DEFAULT)
     parser.add_argument("--output", type=Path, default=OUTPUT_DEFAULT)
     parser.add_argument("--active-from", type=int, default=90)
@@ -172,8 +156,8 @@ def main() -> int:
     zero = rebase_position(zero)
     trajectories = {
         "GT / IMU center": gt,
-        "T2 / fixed 3 s / estimated state": baseline,
-        "T2 / adaptive 2.1 s / zero state": zero,
+        "PACE-VIO-2S / fixed 3 s / estimated state": baseline,
+        "PACE-VIO-2S / adaptive 2.1 s / zero state": zero,
     }
     colors = ["#111827", "#2563eb", "#dc2626"]
     metric_rows = []
@@ -231,7 +215,7 @@ def main() -> int:
 <html><head><meta charset="utf-8"><title>Circle zero initialization ablation</title>
 <style>body{{font-family:Arial,sans-serif;margin:24px;color:#18212f}} table{{border-collapse:collapse;width:100%;margin-top:20px}} th,td{{border:1px solid #d8dee8;padding:8px;text-align:right}} th:first-child,td:first-child{{text-align:left}} .note{{color:#526071;line-height:1.5}}</style></head>
 <body><h1>Circle normal-noise initialization ablation</h1>
-<p class="note">All trajectories are expressed at the IMU center in world NWU and independently translation-rebased at frame 0. No rotation, scale, SE(3), or trajectory fitting is applied. Metrics use the common segment from frame {args.active_from}. The blue baseline uses the trusted cached T2 full run with fixed 3 s estimated initialization; the red run uses live MACVO with adaptive completion at 2.1 s and deliberately applies zero attitude, velocity, accelerometer bias, and gyro bias.</p>
+<p class="note">All trajectories are expressed at the IMU center in world NWU and independently translation-rebased at frame 0. No rotation, scale, SE(3), or trajectory fitting is applied. Metrics use the common segment from frame {args.active_from}. The blue baseline uses the trusted cached PACE-VIO-2S full run with fixed 3 s estimated initialization; the red run uses live MACVO with adaptive completion at 2.1 s and deliberately applies zero attitude, velocity, accelerometer bias, and gyro bias.</p>
 <img src="{png_name}" alt="trajectory comparison" style="width:100%;max-width:1500px"><h2>Metrics</h2>{table_html}</body></html>"""
     (args.output / "interactive_zero_initialization_ablation.html").write_text(
         html, encoding="utf-8"
@@ -259,7 +243,7 @@ def main() -> int:
             "static_mode": "fixed",
             "duration_s": 3.0,
             "state_policy": "estimated",
-            "visual_source": "trusted cached full T2 run",
+            "visual_source": "trusted cached full PACE-VIO-2S run",
         },
         "zero_initialization": {
             "path": str(zero_pose_path),
@@ -267,7 +251,7 @@ def main() -> int:
             "visual_source": "live MACVO stereo frontend",
         },
         "comparison_limit": (
-            "The runs share dataset, model family and T2 backend but do not reuse "
+            "The runs share dataset, model family and PACE-VIO-2S backend but do not reuse "
             "an identical point-level frontend realization or initialization boundary."
         ),
     }

@@ -3,6 +3,7 @@ import pypose as pp
 import pytest
 import torch
 
+from Utility.PACEFactorPacket import PACEFactorPacket
 from Utility.T2FactorPacket import T2FactorPacket
 from Utility.TwoStateVIO import (
     ImuPreintegrationFactor,
@@ -24,7 +25,7 @@ def _state(translation, velocity) -> NavigationState:
     )
 
 
-def _packet() -> T2FactorPacket:
+def _packet() -> PACEFactorPacket:
     extrinsic = pp.from_matrix(torch.tensor([[
         [1.0, 0.0, 0.0, -0.417],
         [0.0, -1.0, 0.0, 0.180],
@@ -55,7 +56,7 @@ def _packet() -> T2FactorPacket:
         extrinsic_CI=extrinsic,
         marginal_mode="full",
     )
-    return T2FactorPacket.create(
+    return PACEFactorPacket.create(
         frame_i=90,
         frame_j=91,
         state_i_initial=_state([0.0, 0.0, 0.0], [0.1, 0.0, 0.0]),
@@ -64,6 +65,10 @@ def _packet() -> T2FactorPacket:
         visual=visual,
         extrinsic_CI=extrinsic,
     )
+
+
+def test_legacy_t2_packet_name_is_a_compatibility_alias():
+    assert T2FactorPacket is PACEFactorPacket
 
 
 def test_packet_materializes_backend_neutral_float64_payload():
@@ -109,7 +114,7 @@ def test_packet_rejects_mismatched_visual_extrinsic():
         torch.tensor([[0.01, 0.0, 0.0, 0.0, 0.0, 0.0]], dtype=torch.float64)
     ).Exp().tensor()
     with pytest.raises(ValueError, match="different T_CI"):
-        T2FactorPacket.create(
+        PACEFactorPacket.create(
             frame_i=packet.frame_i,
             frame_j=packet.frame_j,
             state_i_initial=packet.state_i_initial,
@@ -136,7 +141,7 @@ def test_packet_rejects_nonfinite_measurement():
         gravity_handling=packet.imu.gravity_handling,
     )
     with pytest.raises(ValueError, match="NaN/Inf"):
-        T2FactorPacket.create(
+        PACEFactorPacket.create(
             frame_i=packet.frame_i,
             frame_j=packet.frame_j,
             state_i_initial=packet.state_i_initial,

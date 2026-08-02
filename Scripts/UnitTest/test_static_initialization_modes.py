@@ -7,7 +7,7 @@ import torch
 from DataLoader.Dataset.GeneralStereoIMU import _continuous_imu_noise_density
 from Module.IMUPreintegration import _raw_sample_periods_s
 from Odometry.MACVO import MACVO
-from Scripts.run_realtime_t2 import validate_static_initialization_options
+from Scripts.run_pace_vio import validate_static_initialization_options
 from Utility.IMUKinematics import (
     estimate_static_imu_initialization,
     evaluate_adaptive_static_imu_initialization,

@@ -2,9 +2,9 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-DATA_ROOT="${DATA_ROOT:-/mnt/e/文档/holoocean/code/recordings/batch_clear_truth_paths_20260713_static63_variants}"
-OUTPUT_ROOT="${OUTPUT_ROOT:-/home/admin1/macvo-dev/analysis_t2_isam2_realtime_full_three_scenes_20260722}"
-MODEL="${MODEL:-/home/admin1/macvo-dev/Model/MACVO_FrontendCov.pth}"
+DATA_ROOT="${DATA_ROOT:?Set DATA_ROOT to the directory containing the three datasets}"
+OUTPUT_ROOT="${OUTPUT_ROOT:-$ROOT/Results/pace_vio_isam2_three_scenes}"
+MODEL="${MODEL:-$ROOT/Model/MACVO_FrontendCov.pth}"
 PYTHON_BIN="${PYTHON_BIN:-$(command -v python)}"
 
 scenes=(
@@ -20,7 +20,7 @@ for scene in "${scenes[@]}"; do
   start_utc="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   printf '%s,running,%s,\n' "$scene" "$start_utc" >> "$OUTPUT_ROOT/three_scene_status.csv"
   echo "[$(date '+%F %T')] START $scene"
-  "$PYTHON_BIN" "$ROOT/Scripts/run_realtime_t2.py" \
+  "$PYTHON_BIN" "$ROOT/Scripts/run_pace_vio.py" \
     --dataset "$DATA_ROOT/$scene" \
     --output "$OUTPUT_ROOT" \
     --model "$MODEL" \

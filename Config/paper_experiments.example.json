@@ -1,0 +1,43 @@
+{
+  "output": "Results/paper_experiments",
+  "model": "Model/MACVO_FrontendCov.pth",
+  "runtime": {
+    "mode": "pipeline",
+    "cpu_threads": 4,
+    "timeout_s": 21600
+  },
+  "datasets": [
+    {
+      "scenario": "Circle",
+      "path": "/absolute/path/to/circle",
+      "static_initialization": {
+        "mode": "fixed",
+        "duration_s": 3.0
+      }
+    },
+    {
+      "scenario": "Figure-eight",
+      "path": "/absolute/path/to/figure_eight",
+      "static_initialization": {
+        "mode": "fixed",
+        "duration_s": 3.0
+      }
+    },
+    {
+      "scenario": "Rectangle",
+      "path": "/absolute/path/to/rectangle",
+      "static_initialization": {
+        "mode": "fixed",
+        "duration_s": 3.0
+      }
+    },
+    {
+      "scenario": "Field",
+      "path": "/absolute/path/to/field_sequence",
+      "static_initialization": {
+        "mode": "off"
+      },
+      "evaluation_alignment_json": "/absolute/path/to/field_alignment.json"
+    }
+  ]
+}

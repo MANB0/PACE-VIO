@@ -791,7 +791,7 @@ class MACVO(IOdometry[T_SensorFrame], ConfigTestable):
                         pp.SE3(graph_data.from_pose)
                         @ pp.SE3(relative_for_graph).Inv()
                     )
-                diagnostics["t2_compression_source"] = "online_visual_optimum"
+                diagnostics["pace_compression_source"] = "online_visual_optimum"
             from_idx = int(graph_data.from_idx.reshape(-1)[0].item())
             frame_idx = int(graph_data.frame_idx.reshape(-1)[0].item())
             previous_raw = self._live_macvo_raw_poses.get(from_idx)
@@ -3854,6 +3854,71 @@ class MACVO(IOdometry[T_SensorFrame], ConfigTestable):
             ),
             isam2_initial_bias_mismatch_norm=opt_diag.get(
                 "isam2_initial_bias_mismatch_norm", ""
+            ),
+            near_zero_velocity_enabled=int(
+                bool(opt_diag.get("near_zero_velocity_enabled", False))
+            ),
+            near_zero_velocity_detector_version=opt_diag.get(
+                "near_zero_velocity_detector_version", "disabled"
+            ),
+            near_zero_velocity_candidate=int(
+                bool(opt_diag.get("near_zero_velocity_candidate", False))
+            ),
+            near_zero_velocity_active=int(
+                bool(opt_diag.get("near_zero_velocity_active", False))
+            ),
+            near_zero_velocity_entered=int(
+                bool(opt_diag.get("near_zero_velocity_entered", False))
+            ),
+            near_zero_velocity_exited=int(
+                bool(opt_diag.get("near_zero_velocity_exited", False))
+            ),
+            near_zero_velocity_estimated_speed_m_s=opt_diag.get(
+                "near_zero_velocity_estimated_speed_m_s", ""
+            ),
+            near_zero_velocity_imu_angular_rate_rad_s=opt_diag.get(
+                "near_zero_velocity_imu_angular_rate_rad_s", ""
+            ),
+            near_zero_velocity_visual_angular_rate_rad_s=opt_diag.get(
+                "near_zero_velocity_visual_angular_rate_rad_s", ""
+            ),
+            near_zero_velocity_visual_body_speed_m_s=opt_diag.get(
+                "near_zero_velocity_visual_body_speed_m_s", ""
+            ),
+            near_zero_velocity_angular_rate_disagreement_rad_s=opt_diag.get(
+                "near_zero_velocity_angular_rate_disagreement_rad_s", ""
+            ),
+            near_zero_velocity_rotation_vector_rate_difference_rad_s=opt_diag.get(
+                "near_zero_velocity_rotation_vector_rate_difference_rad_s", ""
+            ),
+            near_zero_velocity_rotation_axis_cosine=opt_diag.get(
+                "near_zero_velocity_rotation_axis_cosine", ""
+            ),
+            near_zero_velocity_zero_translation_nis=opt_diag.get(
+                "near_zero_velocity_zero_translation_nis", ""
+            ),
+            near_zero_velocity_zero_translation_dof=opt_diag.get(
+                "near_zero_velocity_zero_translation_dof", ""
+            ),
+            near_zero_velocity_zero_translation_nis_per_dof=opt_diag.get(
+                "near_zero_velocity_zero_translation_nis_per_dof", ""
+            ),
+            near_zero_velocity_zero_translation_position_residual_norm_m=opt_diag.get(
+                "near_zero_velocity_zero_translation_position_residual_norm_m",
+                "",
+            ),
+            near_zero_velocity_zero_translation_velocity_residual_norm_m_s=opt_diag.get(
+                "near_zero_velocity_zero_translation_velocity_residual_norm_m_s",
+                "",
+            ),
+            near_zero_velocity_reason=opt_diag.get(
+                "near_zero_velocity_reason", "disabled"
+            ),
+            near_zero_velocity_prior_std_m_s=opt_diag.get(
+                "near_zero_velocity_prior_std_m_s", ""
+            ),
+            near_zero_velocity_prior_cost=opt_diag.get(
+                "near_zero_velocity_prior_cost", ""
             ),
             est_delta_x=est_delta_x,
             est_delta_y=est_delta_y,
