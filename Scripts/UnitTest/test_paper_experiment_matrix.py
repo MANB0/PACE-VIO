@@ -7,6 +7,10 @@ from Scripts.run_paper_experiments import METHODS, build_command, load_manifest,
 def _manifest(tmp_path: Path) -> tuple[Path, dict]:
     dataset = tmp_path / "circle_data"
     dataset.mkdir()
+    (dataset / "motion_reference.csv").write_text(
+        "frame_j,reference_active\n1,0\n",
+        encoding="utf-8",
+    )
     manifest = {
         "datasets": [{
             "scenario": "Circle",
@@ -40,6 +44,7 @@ def test_matrix_uses_all_required_method_combinations_and_full_sequences(tmp_pat
     ]
     assert all("--seq-to" not in command for command in commands)
     assert all("--paper-evaluation" in command for command in commands)
+    assert all("--motion-reference-csv" in command for command in commands)
     assert commands[-1][commands[-1].index("--near-zero-velocity-detector") + 1] == "v2"
 
 

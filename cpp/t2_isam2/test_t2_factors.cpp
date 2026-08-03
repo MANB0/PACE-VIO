@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <functional>
 #include <iostream>
 #include <stdexcept>
 
@@ -48,7 +49,7 @@ void test_visual_jacobian() {
 
   Matrix H_i, H_j;
   factor.evaluateError(pose_i, pose_j, H_i, H_j);
-  const auto function = [&factor](const Pose3& first, const Pose3& second) {
+  const std::function<Vector(const Pose3&, const Pose3&)> function = [&factor](const Pose3& first, const Pose3& second) {
     return factor.evaluateError(first, second);
   };
   const Matrix numerical_i = gtsam::numericalDerivative21(
@@ -97,7 +98,7 @@ void test_direct_uvd_jacobian() {
 
   Matrix H_i, H_j;
   factor.evaluateError(pose_i, pose_j, H_i, H_j);
-  const auto function = [&factor](const Pose3& first, const Pose3& second) {
+  const std::function<Vector(const Pose3&, const Pose3&)> function = [&factor](const Pose3& first, const Pose3& second) {
     return factor.evaluateError(first, second);
   };
   const Matrix numerical_i = gtsam::numericalDerivative21(
@@ -150,7 +151,7 @@ void test_imu_residual_and_jacobians() {
   require(H_xi.allFinite() && H_vi.allFinite() && H_bi.allFinite() &&
           H_xj.allFinite() && H_vj.allFinite(), "cached IMU Jacobian contains NaN/Inf");
 
-  const auto function = [&factor](
+  const std::function<Vector(const Pose3&, const Vector3&, const ConstantBias&, const Pose3&, const Vector3&)> function = [&factor](
       const Pose3& first_pose, const Vector3& first_velocity,
       const ConstantBias& first_bias, const Pose3& second_pose,
       const Vector3& second_velocity) {

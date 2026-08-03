@@ -114,6 +114,13 @@ def test_paper_evaluation_uses_complete_active_sequence(tmp_path: Path):
                 "backend_submitted": 1,
                 "static_initialization_active": 0,
             })
+    (bundle / "elapsed_time.json").write_text(
+        json.dumps({
+            "CPU_ElapsedTime": {"Odom_Runtime": [float(index) for index in range(100)]},
+            "GPU_ElapsedTime": {},
+        }),
+        encoding="utf-8",
+    )
 
     output = export_paper_evaluation(
         project_root=tmp_path,
@@ -133,6 +140,7 @@ def test_paper_evaluation_uses_complete_active_sequence(tmp_path: Path):
     assert summary["timing"]["edge_count"] == 3
     assert summary["timing"]["factor_build_ms"]["median"] == 1.0
     assert summary["timing"]["backend_update_ms"]["median"] == 2.5
+    assert summary["timing"]["end_to_end_frame_ms"]["median"] == 92.0
     assert summary["motion_detection"]["available"] is False
     assert len(list(csv.DictReader((output / "metrics_per_edge.csv").open()))) == 3
     assert dataset_manifest["left_image_count"] == 4
@@ -146,6 +154,7 @@ def test_paper_evaluation_uses_complete_active_sequence(tmp_path: Path):
     assert run_summary["backend"] == "isam2"
     assert float(run_summary["factor_build_median_ms"]) == 1.0
     assert float(run_summary["backend_update_median_ms"]) == 2.5
+    assert float(run_summary["end_to_end_frame_median_ms"]) == 92.0
     assert float(run_summary["convergence_rate"]) == 1.0
     evaluated = list(csv.DictReader((output / "trajectory_evaluated.csv").open()))
     evaluated_gt = list(csv.DictReader((output / "ground_truth_evaluated.csv").open()))

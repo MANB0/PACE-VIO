@@ -7,7 +7,7 @@
 #include <gtsam/navigation/ImuBias.h>
 #include <gtsam/linear/LossFunctions.h>
 #include <gtsam/linear/NoiseModel.h>
-#include <gtsam/nonlinear/NoiseModelFactorN.h>
+#include <gtsam/nonlinear/NonlinearFactor.h>
 
 #include <cmath>
 #include <stdexcept>

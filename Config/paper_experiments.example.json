@@ -9,7 +9,7 @@
   "datasets": [
     {
       "scenario": "Circle",
-      "path": "/absolute/path/to/circle",
+      "path": "/absolute/path/to/pace_circle_2x",
       "static_initialization": {
         "mode": "fixed",
         "duration_s": 3.0
@@ -17,7 +17,7 @@
     },
     {
       "scenario": "Figure-eight",
-      "path": "/absolute/path/to/figure_eight",
+      "path": "/absolute/path/to/pace_figure_eight_2x",
       "static_initialization": {
         "mode": "fixed",
         "duration_s": 3.0
@@ -25,19 +25,11 @@
     },
     {
       "scenario": "Rectangle",
-      "path": "/absolute/path/to/rectangle",
+      "path": "/absolute/path/to/pace_rectangle_2x",
       "static_initialization": {
         "mode": "fixed",
         "duration_s": 3.0
       }
-    },
-    {
-      "scenario": "Field",
-      "path": "/absolute/path/to/field_sequence",
-      "static_initialization": {
-        "mode": "off"
-      },
-      "evaluation_alignment_json": "/absolute/path/to/field_alignment.json"
     }
   ]
 }

@@ -105,6 +105,10 @@ def build_command(
     if alignment:
         command += ["--evaluation-alignment-json", str(Path(str(alignment)).expanduser().resolve())]
     motion_reference = dataset.get("motion_reference_csv")
+    if not motion_reference:
+        default_motion_reference = dataset_path / "motion_reference.csv"
+        if default_motion_reference.is_file():
+            motion_reference = default_motion_reference
     if motion_reference:
         command += ["--motion-reference-csv", str(Path(str(motion_reference)).expanduser().resolve())]
     if dry_run:
@@ -170,6 +174,8 @@ def summarize(output_root: Path, manifest: dict[str, Any]) -> Path:
                 "backend_update_p95_ms": _timing(summary, "backend_update_ms", "p95"),
                 "total_compute_median_ms": _timing(summary, "total_compute_ms", "median"),
                 "total_compute_p95_ms": _timing(summary, "total_compute_ms", "p95"),
+                "end_to_end_frame_median_ms": _timing(summary, "end_to_end_frame_ms", "median"),
+                "end_to_end_frame_p95_ms": _timing(summary, "end_to_end_frame_ms", "p95"),
                 "convergence_rate": summary.get("timing", {}).get("convergence_rate"),
                 "bundle": str(bundle),
             })
@@ -202,6 +208,8 @@ def summarize(output_root: Path, manifest: dict[str, Any]) -> Path:
                     "backend_update_p95_ms": None,
                     "total_compute_median_ms": None,
                     "total_compute_p95_ms": None,
+                    "end_to_end_frame_median_ms": None,
+                    "end_to_end_frame_p95_ms": None,
                     "convergence_rate": None,
                     "bundle": str(bundle),
                 })

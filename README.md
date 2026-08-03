@@ -186,12 +186,19 @@ C++ 扩展 ABI 暂时保留兼容入口，但不再作为论文、界面或新�
 ## 论文全量重跑
 
 环境脚本会同时准备 MACVO 前端、项目本地 GTSAM 和 PACE-VIO iSAM2
-扩展。复制 `Config/paper_experiments.example.json`，只修改数据集路径和各
-序列的静止初始化模式，然后执行：
+扩展。当前论文协议固定使用 `Circle`、`Figure-eight` 和 `Rectangle` 三个
+2x 全量序列。复制 `Config/paper_experiments.example.json` 为
+`Config/paper_experiments.json`，只修改其中三个数据集路径，然后执行：
 
 ```bash
 python Scripts/run_paper_experiments.py \
   --manifest Config/paper_experiments.json
+```
+
+在 Slurm GPU 节点上可直接提交同一清单：
+
+```bash
+sbatch run_paper_2x.sbatch
 ```
 
 该入口固定对每个场景运行 `Pose-iSAM2`、`UVD-iSAM2`、`PACE-Two`、
@@ -199,3 +206,6 @@ python Scripts/run_paper_experiments.py \
 `paper_run_summary.csv` 可直接用于论文表格，`paper_comparison_sources.json`
 记录每项对比对应的原始结果包；每状态 APE、每边 RPE、最终/在线轨迹、
 因子构造时间和后端更新时间仍保存在各运行的 `paper_evaluation/` 中。
+`total_compute_ms` 是由已插桩模块组成的计算时间，`end_to_end_frame_ms`
+则来自 `Odom_Runtime`，表示活动图像帧从里程计入口到返回的真实端到端耗时；
+论文中的完整帧处理时间应使用后者。

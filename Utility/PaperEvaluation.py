@@ -464,10 +464,18 @@ def _timing_and_solver_outputs(bundle: Path, result_root: Path, output_dir: Path
     diagnostic_rows = _read_csv_rows(bundle / "frame_pair_diagnostics.csv")
     pipeline_rows = _read_csv_rows(result_root / "pipeline_trace.csv")
     pipeline_by_edge = {_edge_key(row): row for row in pipeline_rows if _edge_key(row) is not None}
+    odom_runtime_ms: list[float | None] = []
+    elapsed_path = bundle / "elapsed_time.json"
+    if elapsed_path.is_file():
+        elapsed = json.loads(elapsed_path.read_text(encoding="utf-8"))
+        raw_runtime = elapsed.get("CPU_ElapsedTime", {}).get("Odom_Runtime", [])
+        if isinstance(raw_runtime, list):
+            odom_runtime_ms = [_finite_or_none(value) for value in raw_runtime]
     timing_fields = (
         "edge_index", "frame_i", "frame_j", "timestamp_i_ns", "timestamp_j_ns",
         "frontend_ms", "factor_build_ms", "backend_update_ms", "backend_total_ms",
         "backend_commit_latency_ms", "commit_ms", "total_compute_ms",
+        "end_to_end_frame_ms",
         "backend", "converged",
     )
     timing_rows: list[dict[str, Any]] = []
@@ -496,6 +504,11 @@ def _timing_and_solver_outputs(bundle: Path, result_root: Path, output_dir: Path
         # latency spanning the following frontend call, not another compute stage.
         compute_parts = (frontend, backend_total, commit)
         compute_total = sum(value for value in compute_parts if value is not None)
+        end_to_end_frame = (
+            odom_runtime_ms[key[1]]
+            if 0 <= key[1] < len(odom_runtime_ms)
+            else None
+        )
         converged_text = str(row.get("two_state_solver_converged", "")).strip().lower()
         converged = 1 if converged_text in {"1", "true", "yes"} else 0
         timing_rows.append({
@@ -511,6 +524,7 @@ def _timing_and_solver_outputs(bundle: Path, result_root: Path, output_dir: Path
             "backend_commit_latency_ms": wait,
             "commit_ms": commit,
             "total_compute_ms": compute_total,
+            "end_to_end_frame_ms": end_to_end_frame,
             "backend": backend,
             "converged": converged,
         })
@@ -939,7 +953,8 @@ def export_paper_evaluation(
         "backend", "edge_count", "frontend_median_ms", "frontend_p95_ms",
         "factor_build_median_ms", "factor_build_p95_ms", "backend_update_median_ms",
         "backend_update_p95_ms", "backend_total_median_ms", "backend_total_p95_ms",
-        "total_compute_median_ms", "total_compute_p95_ms", "convergence_rate",
+        "total_compute_median_ms", "total_compute_p95_ms",
+        "end_to_end_frame_median_ms", "end_to_end_frame_p95_ms", "convergence_rate",
         "process_wall_runtime_s", "effective_active_edge_rate_hz", "detector_available",
         "tp", "fn", "fp", "tn", "precision", "recall",
     )
@@ -964,6 +979,8 @@ def export_paper_evaluation(
             "backend_total_p95_ms": timing_value("backend_total_ms", "p95"),
             "total_compute_median_ms": timing_value("total_compute_ms", "median"),
             "total_compute_p95_ms": timing_value("total_compute_ms", "p95"),
+            "end_to_end_frame_median_ms": timing_value("end_to_end_frame_ms", "median"),
+            "end_to_end_frame_p95_ms": timing_value("end_to_end_frame_ms", "p95"),
             "convergence_rate": timing.get("convergence_rate"),
             "process_wall_runtime_s": timing.get("process_wall_runtime_s"),
             "effective_active_edge_rate_hz": timing.get("effective_active_edge_rate_hz"),
