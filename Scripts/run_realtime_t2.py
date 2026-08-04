@@ -21,6 +21,8 @@ import yaml
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+from Utility.NearZeroVelocityDetector import FROZEN_NEAR_ZERO_VELOCITY_V2
+
 BASE_ODOM = ROOT / "Config/Experiment/MACVO/PACE_VIO_Realtime.yaml"
 BASE_SEQUENCE = ROOT / "Config/Sequence/realtime_stereo_imu.yaml"
 DEFAULT_MODEL = ROOT / "Model/MACVO_FrontendCov.pth"
@@ -91,13 +93,50 @@ def configure_odom(
     visual_factor: str,
     near_zero_velocity_detector: str,
     near_zero_velocity_prior_std_m_s: float,
+    visual_cache_mode: str = "live",
+    visual_cache_path: Path | None = None,
 ) -> None:
     cfg = load_yaml(BASE_ODOM)
     args = cfg["Odometry"]["args"]
     frontend = cfg["Odometry"]["frontend"]["args"]
     optimizer = cfg["Odometry"]["optimizer"]["args"]
     args["pipeline_trace_path"] = str(trace)
+    args["visual_cache_mode"] = "replay" if visual_cache_mode == "replay" else "off"
+    args["visual_cache_path"] = (
+        str(visual_cache_path) if visual_cache_mode == "replay" else None
+    )
     args.pop("imu_static_initialization_enable", None)
+    if visual_cache_mode == "record":
+        # Cache recording is a pure visual MACVO pass. The visual TwoFrame_PGO
+        # is retained only to chain a camera trajectory and express cached
+        # local observations consistently; no IMU or VIO backend is active.
+        cfg["Odometry"]["name"] = "MACVO-Visual-Cache-Recorder"
+        args.update(
+            {
+                "mapping": False,
+                "imu_static_initialization_mode": "off",
+                "imu_static_initialization_state_policy": "estimated",
+                "imu_rot_prior_enable": False,
+                "imu_trans_prior_enable": False,
+                "imu_pose_fusion_enable": False,
+                "imu_vio_velocity_feedback_enable": False,
+                "imu_vio_bias_feedback_enable": False,
+            }
+        )
+        cfg["Odometry"]["optimizer"] = {
+            "type": "TwoFrame_PGO",
+            "args": {
+                "device": "cpu",
+                "parallel": bool(parallel),
+                "autodiff": False,
+                "graph_type": "disp",
+                "vectorize": True,
+                "imu_rot_prior": False,
+            },
+        }
+        frontend["weight"] = str(model)
+        write_yaml(target, cfg)
+        return
     args["imu_static_initialization_mode"] = str(static_mode)
     args["imu_static_initialization_state_policy"] = str(static_state_policy)
     if static_duration_s is None:
@@ -117,6 +156,8 @@ def configure_odom(
         "uvd": "direct_uvd",
         "pace": "compressed_uvd",
     }[str(visual_factor)]
+    if visual_cache_mode == "replay":
+        cfg["Odometry"]["frontend"] = {"type": "ReplayFrontend", "args": {}}
     optimizer["two_state_near_zero_velocity_enable"] = (
         near_zero_velocity_detector != "off"
     )
@@ -130,13 +171,13 @@ def configure_odom(
     if near_zero_velocity_detector == "v2":
         optimizer.update(
             {
-                "two_state_near_zero_velocity_v2_minimum_imu_angular_rate_rad_s": 0.30,
-                "two_state_near_zero_velocity_v2_minimum_visual_angular_rate_rad_s": 0.25,
-                "two_state_near_zero_velocity_v2_maximum_rotation_vector_rate_difference_rad_s": 0.08,
-                "two_state_near_zero_velocity_v2_minimum_rotation_axis_cosine": 0.90,
-                "two_state_near_zero_velocity_v2_maximum_zero_translation_nis_per_dof": 3.5,
-                "two_state_near_zero_velocity_enter_hold_s": 0.20,
-                "two_state_near_zero_velocity_release_hold_s": 0.10,
+                "two_state_near_zero_velocity_v2_minimum_imu_angular_rate_rad_s": FROZEN_NEAR_ZERO_VELOCITY_V2.minimum_imu_angular_rate_rad_s,
+                "two_state_near_zero_velocity_v2_minimum_visual_angular_rate_rad_s": FROZEN_NEAR_ZERO_VELOCITY_V2.minimum_visual_angular_rate_rad_s,
+                "two_state_near_zero_velocity_v2_maximum_rotation_vector_rate_difference_rad_s": FROZEN_NEAR_ZERO_VELOCITY_V2.maximum_rotation_vector_rate_difference_rad_s,
+                "two_state_near_zero_velocity_v2_minimum_rotation_axis_cosine": FROZEN_NEAR_ZERO_VELOCITY_V2.minimum_rotation_axis_cosine,
+                "two_state_near_zero_velocity_v2_maximum_zero_translation_nis_per_dof": FROZEN_NEAR_ZERO_VELOCITY_V2.maximum_zero_translation_nis_per_dof,
+                "two_state_near_zero_velocity_enter_hold_s": FROZEN_NEAR_ZERO_VELOCITY_V2.enter_hold_s,
+                "two_state_near_zero_velocity_release_hold_s": FROZEN_NEAR_ZERO_VELOCITY_V2.release_hold_s,
             }
         )
     write_yaml(target, cfg)
@@ -196,6 +237,34 @@ def validate_static_initialization_options(args: argparse.Namespace) -> None:
         )
 
 
+def validate_visual_cache_options(args: argparse.Namespace) -> Path | None:
+    mode = str(args.visual_cache_mode)
+    cache = (
+        None
+        if args.visual_cache_path is None
+        else args.visual_cache_path.expanduser().resolve()
+    )
+    if mode == "live":
+        if cache is not None:
+            raise ValueError("--visual-cache-path is valid only in record or replay mode")
+        return None
+    if cache is None:
+        raise ValueError(f"--visual-cache-mode {mode} requires --visual-cache-path")
+    if args.seq_from != 0 or args.seq_to != -1:
+        raise ValueError("visual cache record/replay requires the complete sequence")
+    if mode == "record":
+        if cache.exists():
+            raise FileExistsError(
+                f"visual cache target already exists: {cache}; choose a new path"
+            )
+        return cache
+    if mode == "replay":
+        from Scripts.record_visual_factor_cache import validate_visual_cache_bundle
+
+        return validate_visual_cache_bundle(cache, args.visual_factor)
+    raise ValueError(f"unsupported visual cache mode: {mode!r}")
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset", type=Path, required=True)
@@ -204,6 +273,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mode", choices=("pipeline", "serial"), default="pipeline")
     parser.add_argument("--seq-from", type=int, default=0)
     parser.add_argument("--seq-to", type=int, default=-1, help="Exclusive stop; -1 runs all frames")
+    parser.add_argument(
+        "--visual-cache-mode",
+        choices=("live", "record", "replay"),
+        default="live",
+        help=(
+            "live runs MACVO normally; record runs MACVO once and writes a reusable "
+            "visual cache; replay skips the neural frontend and loads that cache"
+        ),
+    )
+    parser.add_argument(
+        "--visual-cache-path",
+        type=Path,
+        help="Cache output for record mode or existing cache directory for replay mode.",
+    )
     parser.add_argument(
         "--static-init-mode",
         choices=("fixed", "adaptive", "off"),
@@ -315,23 +398,31 @@ def main() -> int:
     fmt = image_format(dataset)
 
     validate_static_initialization_options(args)
+    visual_cache_path = validate_visual_cache_options(args)
     if args.cpu_threads < 1:
         raise ValueError("--cpu-threads must be >= 1")
     if args.near_zero_velocity_prior_std_m_s <= 0.0:
         raise ValueError("--near-zero-velocity-prior-std-m-s must be > 0")
+    if args.visual_cache_mode == "record" and args.near_zero_velocity_detector != "off":
+        raise ValueError("record mode does not run the conditional velocity detector")
     if (
-        args.near_zero_velocity_detector != "off"
+        args.visual_cache_mode != "record"
+        and args.near_zero_velocity_detector != "off"
         and args.vio_backend != "isam2"
     ):
         raise ValueError(
             "--near-zero-velocity-detector currently requires --vio-backend isam2"
         )
-    if not args.dry_run and not model.is_file():
+    if (
+        not args.dry_run
+        and args.visual_cache_mode in {"live", "record"}
+        and not model.is_file()
+    ):
         raise FileNotFoundError(
             f"Missing frontend model: {model}\n"
             "Run: python Scripts/download_models.py"
         )
-    if args.vio_backend == "isam2":
+    if args.visual_cache_mode != "record" and args.vio_backend == "isam2":
         from Utility.PACEISAM2Backend import IncrementalPACEISAM2Backend
 
         IncrementalPACEISAM2Backend(
@@ -369,6 +460,8 @@ def main() -> int:
         near_zero_velocity_prior_std_m_s=(
             args.near_zero_velocity_prior_std_m_s
         ),
+        visual_cache_mode=args.visual_cache_mode,
+        visual_cache_path=visual_cache_path,
     )
     configure_sequence(sequence_path, dataset, fmt)
 
@@ -377,14 +470,44 @@ def main() -> int:
         "project_root": str(ROOT),
         "dataset": str(dataset),
         "mode": args.mode,
-        "frontend": "live MACVO stereo frontend (no visual cache)",
+        "frontend": {
+            "live": "live MACVO stereo frontend",
+            "record": "live MACVO stereo frontend with post-run cache recording",
+            "replay": "validated MACVO visual cache replay",
+        }[args.visual_cache_mode],
+        "visual_cache": {
+            "mode": args.visual_cache_mode,
+            "path": None if visual_cache_path is None else str(visual_cache_path),
+            "complete_sequence_required": args.visual_cache_mode != "live",
+        },
         "project": "PACE-VIO",
-        "backend": args.vio_backend,
-        "visual_factor": args.visual_factor,
+        "backend": (
+            "none (pure visual cache recording)"
+            if args.visual_cache_mode == "record"
+            else args.vio_backend
+        ),
+        "visual_factor": (
+            "raw MACVO observations"
+            if args.visual_cache_mode == "record"
+            else args.visual_factor
+        ),
         "near_zero_velocity": {
             "detector": args.near_zero_velocity_detector,
             "prior_std_m_s": args.near_zero_velocity_prior_std_m_s,
             "production_default": "off",
+            "thresholds": (
+                None
+                if args.near_zero_velocity_detector != "v2"
+                else {
+                    "minimum_imu_angular_rate_rad_s": FROZEN_NEAR_ZERO_VELOCITY_V2.minimum_imu_angular_rate_rad_s,
+                    "minimum_visual_angular_rate_rad_s": FROZEN_NEAR_ZERO_VELOCITY_V2.minimum_visual_angular_rate_rad_s,
+                    "maximum_rotation_vector_rate_difference_rad_s": FROZEN_NEAR_ZERO_VELOCITY_V2.maximum_rotation_vector_rate_difference_rad_s,
+                    "minimum_rotation_axis_cosine": FROZEN_NEAR_ZERO_VELOCITY_V2.minimum_rotation_axis_cosine,
+                    "maximum_zero_translation_nis_per_dof": FROZEN_NEAR_ZERO_VELOCITY_V2.maximum_zero_translation_nis_per_dof,
+                    "enter_hold_s": FROZEN_NEAR_ZERO_VELOCITY_V2.enter_hold_s,
+                    "release_hold_s": FROZEN_NEAR_ZERO_VELOCITY_V2.release_hold_s,
+                }
+            ),
         },
         "preintegration": "standard_local_frame_preintegration",
         "trajectory_reference": "IMU center for VIO output",
@@ -411,7 +534,7 @@ def main() -> int:
         },
         "ground_truth_available": optional_ref.is_file(),
         "paper_evaluation": {
-            "enabled": bool(args.paper_evaluation),
+            "enabled": bool(args.paper_evaluation and args.visual_cache_mode != "record"),
             "sequence_scope": "complete active sequence",
             "alignment_json": (
                 None
@@ -448,6 +571,13 @@ def main() -> int:
     ]
     if args.seq_to >= 0:
         command += ["--seq_to", str(args.seq_to)]
+    if args.visual_cache_mode == "replay":
+        command += [
+            "--visual-cache-mode",
+            "replay",
+            "--visual-cache-path",
+            str(visual_cache_path),
+        ]
     if args.live_display:
         command += [
             "--live-display",
@@ -460,8 +590,15 @@ def main() -> int:
     print(f"Dataset: {dataset}")
     print(f"Output:  {result_root}")
     print(f"Mode:    {args.mode}")
-    print(f"Backend: {args.vio_backend}")
-    print(f"Factor:  {args.visual_factor}")
+    if args.visual_cache_mode == "record":
+        print("Backend: none (pure visual MACVO)")
+        print("Factor:  raw MACVO observations")
+    else:
+        print(f"Backend: {args.vio_backend}")
+        print(f"Factor:  {args.visual_factor}")
+    print(f"Visual:  {args.visual_cache_mode}")
+    if visual_cache_path is not None:
+        print(f"Cache:   {visual_cache_path}")
     print(f"Command: {shlex.join(command)}", flush=True)
     if args.live_display:
         print(f"Dashboard: http://{args.dashboard_host}:{args.dashboard_port}/", flush=True)
@@ -487,23 +624,29 @@ def main() -> int:
         raise
     elapsed = time.monotonic() - started
     status = "ok" if return_code == 0 else "failed"
-    (result_root / "run_execution.json").write_text(
-        json.dumps(
-            {
-                "schema_version": 1,
-                "process_wall_runtime_s": elapsed,
-                "return_code": int(return_code),
-                "mode": args.mode,
-                "seq_from": args.seq_from,
-                "seq_to": args.seq_to,
-                "startup_and_initialization_included": True,
-            },
-            indent=2,
-        )
-        + "\n",
-        encoding="utf-8",
-    )
-    if return_code == 0 and args.paper_evaluation:
+    cache_record_runtime_s = None
+    if return_code == 0 and args.visual_cache_mode == "record":
+        from Scripts.record_visual_factor_cache import record_visual_factor_cache
+
+        cache_started = time.monotonic()
+        try:
+            cache = record_visual_factor_cache(
+                result_root,
+                visual_cache_path,
+                dataset.name,
+                dataset,
+            )
+            print(f"Visual cache ready: {cache}", flush=True)
+        except Exception as error:
+            status = "cache_record_failed"
+            return_code = 3
+            print(f"Visual cache recording failed: {error}", file=sys.stderr, flush=True)
+        cache_record_runtime_s = time.monotonic() - cache_started
+    if (
+        return_code == 0
+        and args.paper_evaluation
+        and args.visual_cache_mode != "record"
+    ):
         if optional_ref.is_file():
             from Utility.PaperEvaluation import export_paper_evaluation
 
@@ -525,6 +668,29 @@ def main() -> int:
                 "Paper evaluation skipped: dataset has no ref_pose.csv.",
                 flush=True,
             )
+    (result_root / "run_execution.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "process_wall_runtime_s": elapsed,
+                "cache_record_runtime_s": cache_record_runtime_s,
+                "total_wall_runtime_s": time.monotonic() - started,
+                "return_code": int(return_code),
+                "status": status,
+                "mode": args.mode,
+                "visual_cache_mode": args.visual_cache_mode,
+                "visual_cache_path": (
+                    None if visual_cache_path is None else str(visual_cache_path)
+                ),
+                "seq_from": args.seq_from,
+                "seq_to": args.seq_to,
+                "startup_and_initialization_included": True,
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
     append_progress(
         output / "progress.csv",
         {

@@ -19,6 +19,8 @@ from typing import Any
 
 
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 
 @dataclass(frozen=True)
@@ -79,6 +81,8 @@ def build_command(
     model: Path,
     runtime: dict[str, Any],
     dry_run: bool,
+    visual_cache_mode: str = "live",
+    visual_cache_path: Path | None = None,
 ) -> list[str]:
     dataset_path = Path(str(dataset["path"])).expanduser().resolve()
     initialization = dataset.get("static_initialization", {})
@@ -99,6 +103,13 @@ def build_command(
         "--no-live-display",
         "--paper-evaluation",
     ]
+    if visual_cache_mode != "live":
+        if visual_cache_path is None:
+            raise ValueError(f"{visual_cache_mode} requires a visual cache path")
+        command += [
+            "--visual-cache-mode", visual_cache_mode,
+            "--visual-cache-path", str(visual_cache_path.resolve()),
+        ]
     if mode == "fixed":
         command += ["--static-init-duration-s", str(float(initialization["duration_s"]))]
     alignment = dataset.get("evaluation_alignment_json")
@@ -115,6 +126,36 @@ def build_command(
         command.append("--dry-run")
     # Deliberately do not pass --seq-to: every paper experiment uses all frames.
     return command
+
+
+def build_cache_record_command(
+    *,
+    dataset: dict[str, Any],
+    output_root: Path,
+    cache_path: Path,
+    model: Path,
+    runtime: dict[str, Any],
+    dry_run: bool,
+) -> list[str]:
+    command = build_command(
+        dataset=dataset,
+        # Backend/factor values are syntactically required by the shared CLI,
+        # but record mode replaces them with the pure visual recorder config.
+        method=MethodSpec("cache_record", "Visual cache", "two_state", "pace"),
+        output_root=output_root / "_cache_record",
+        model=model,
+        runtime=runtime,
+        dry_run=dry_run,
+        visual_cache_mode="record",
+        visual_cache_path=cache_path,
+    )
+    command[command.index("--paper-evaluation")] = "--no-paper-evaluation"
+    return command
+
+
+def _shared_cache_path(cache_root: Path, dataset: dict[str, Any]) -> Path:
+    dataset_name = Path(str(dataset["path"])).expanduser().resolve().name
+    return cache_root / dataset_name
 
 
 def _result_dir(output_root: Path, dataset: dict[str, Any], method: MethodSpec) -> Path:
@@ -248,6 +289,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--no-resume", action="store_true")
     parser.add_argument("--continue-on-error", action="store_true")
+    parser.add_argument(
+        "--visual-cache-policy",
+        choices=("shared", "live"),
+        default="shared",
+        help=(
+            "shared records one pure-MACVO cache per scene and replays it for every "
+            "method; live independently runs the neural frontend for every method"
+        ),
+    )
+    parser.add_argument(
+        "--visual-cache-root",
+        type=Path,
+        help="Shared cache root; defaults to OUTPUT/visual_cache.",
+    )
     return parser.parse_args()
 
 
@@ -266,6 +321,11 @@ def main() -> int:
         else Path(str(manifest.get("model", ROOT / "Model/MACVO_FrontendCov.pth"))).expanduser().resolve()
     )
     runtime = manifest.get("runtime", {})
+    cache_root = (
+        args.visual_cache_root.expanduser().resolve()
+        if args.visual_cache_root is not None
+        else output_root / "visual_cache"
+    )
     output_root.mkdir(parents=True, exist_ok=True)
     status_path = output_root / "experiment_status.csv"
     with status_path.open("w", newline="", encoding="utf-8") as stream:
@@ -274,6 +334,66 @@ def main() -> int:
 
     failed = False
     for dataset in manifest["datasets"]:
+        shared_cache: Path | None = None
+        cache_failed = False
+        if args.visual_cache_policy == "shared":
+            shared_cache = _shared_cache_path(cache_root, dataset)
+            cache_valid = False
+            if shared_cache.exists():
+                try:
+                    from Scripts.record_visual_factor_cache import validate_visual_cache_bundle
+
+                    validate_visual_cache_bundle(shared_cache)
+                    cache_valid = True
+                    print(
+                        f"[{dataset['scenario']}] Visual cache: reuse {shared_cache}",
+                        flush=True,
+                    )
+                except Exception as error:
+                    print(
+                        f"[{dataset['scenario']}] Existing visual cache is invalid: {error}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    cache_failed = True
+                    failed = True
+            if not cache_valid and not cache_failed:
+                record_command = build_cache_record_command(
+                    dataset=dataset,
+                    output_root=output_root,
+                    cache_path=shared_cache,
+                    model=model,
+                    runtime=runtime,
+                    dry_run=args.dry_run,
+                )
+                print(
+                    f"[{dataset['scenario']}] Visual cache: {' '.join(record_command)}",
+                    flush=True,
+                )
+                if not args.dry_run:
+                    cache_log = output_root / "logs" / str(dataset["scenario"]) / "visual_cache.log"
+                    cache_log.parent.mkdir(parents=True, exist_ok=True)
+                    with cache_log.open("w", encoding="utf-8") as log:
+                        process = subprocess.run(
+                            record_command,
+                            cwd=ROOT,
+                            stdout=log,
+                            stderr=subprocess.STDOUT,
+                            text=True,
+                            check=False,
+                        )
+                    if process.returncode != 0:
+                        cache_failed = True
+                        failed = True
+                        print(f"Visual cache recording failed; inspect {cache_log}", file=sys.stderr)
+                    else:
+                        from Scripts.record_visual_factor_cache import validate_visual_cache_bundle
+
+                        validate_visual_cache_bundle(shared_cache)
+            if cache_failed:
+                if not args.continue_on_error:
+                    return 1
+                continue
         for method in METHODS:
             result_dir = _result_dir(output_root, dataset, method)
             completed = result_dir / "paper_evaluation/metrics_summary.json"
@@ -290,18 +410,25 @@ def main() -> int:
                     model=model,
                     runtime=runtime,
                     dry_run=args.dry_run,
+                    visual_cache_mode=(
+                        "replay" if shared_cache is not None else "live"
+                    ),
+                    visual_cache_path=shared_cache,
                 )
                 started = datetime.now(timezone.utc).isoformat()
                 print(f"[{dataset['scenario']}] {method.paper_name}: {' '.join(command)}", flush=True)
-                with log_path.open("w", encoding="utf-8") as log:
-                    process = subprocess.run(
-                        command,
-                        cwd=ROOT,
-                        stdout=log,
-                        stderr=subprocess.STDOUT,
-                        text=True,
-                        check=False,
-                    )
+                if args.dry_run:
+                    process = subprocess.CompletedProcess(command, 0)
+                else:
+                    with log_path.open("w", encoding="utf-8") as log:
+                        process = subprocess.run(
+                            command,
+                            cwd=ROOT,
+                            stdout=log,
+                            stderr=subprocess.STDOUT,
+                            text=True,
+                            check=False,
+                        )
                 finished = datetime.now(timezone.utc).isoformat()
                 status = "ok" if process.returncode == 0 else f"failed:{process.returncode}"
                 if process.returncode != 0:

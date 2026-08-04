@@ -170,6 +170,41 @@ python Scripts/run_pace_vio.py \
 - PACE-VIO 默认使用 `two_state_fixed_lag + compressed_uvd`，不是 T0 相对位姿因子。
 - 四个连续时间 IMU 噪声密度和相机/IMU 外参从 `metadata.json` 读取；离散化使用 CSV 纳秒时间戳，不依赖名义采样频率。
 
+### 固定 MACVO 视觉输入
+
+同一数据集上的消融实验应先录制一次视觉缓存，再让所有后端和视觉因子回放
+同一份观测，避免神经网络重复推理造成输入差异。三个模式互斥：
+
+```bash
+# 1. 单独运行 MACVO 并生成完整 NPZ 视觉缓存
+python Scripts/run_pace_vio.py \
+  --dataset /absolute/path/to/sequence \
+  --output Results/cache_record \
+  --visual-cache-mode record \
+  --visual-cache-path /absolute/path/to/visual_cache \
+  --no-live-display
+
+# 2. 使用同一缓存运行任意视觉因子和后端
+python Scripts/run_pace_vio.py \
+  --dataset /absolute/path/to/sequence \
+  --output Results/replay \
+  --visual-cache-mode replay \
+  --visual-cache-path /absolute/path/to/visual_cache \
+  --visual-factor pace \
+  --vio-backend isam2
+
+# 3. 不使用缓存，直接运行实时前端
+python Scripts/run_pace_vio.py \
+  --dataset /absolute/path/to/sequence \
+  --visual-cache-mode live
+```
+
+`record` 和 `replay` 只接受完整序列。缓存主体采用 NPZ，包含原始 UVD
+观测、协方差、纯 MACVO 左目中心位姿以及 Pose/PACE 因子旁路数据；CSV
+仅保留为人工检查和来源追踪文件。回放前会核对场景名、帧数、时间戳、内参、
+基线和 SHA-256。论文批处理默认对每个场景录制一次并共享回放；如确需恢复
+旧的独立前端运行，可传入 `--visual-cache-policy live`。
+
 ## 历史回退
 
 私有仓库 `main` 和标签 `realtime-t2-full-20260721` 保存裁切前的只读快照；它们不是当前实现，也不接受独立功能开发。需要恢复历史代码时，应先逐文件审计，再把必要改动移植到当前默认分支并运行本仓库回归测试。
