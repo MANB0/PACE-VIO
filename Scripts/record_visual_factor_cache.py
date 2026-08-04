@@ -39,6 +39,10 @@ from Utility.VisualFactorCache import MATCH_FIELDS, VisualFactorCacheReader
 
 
 CACHE_READY_FILENAME = "cache_ready.json"
+PURE_MACVO_TRAJECTORIES = {
+    "macvo_raw_poses_camera.csv": "pure_macvo_poses_camera.csv",
+    "macvo_raw_poses_imu.csv": "pure_macvo_poses_imu.csv",
+}
 FRAME_FIELDS = ("frames//K", "frames//baseline", "frames//time_ns")
 EDGE_FIELDS = (
     "edge/match2frame1/mapping",
@@ -181,6 +185,11 @@ def _write_pure_macvo_source(
     metadata = result / "metadata.yaml"
     if metadata.is_file():
         shutil.copy2(metadata, destination / metadata.name)
+    for source_name in PURE_MACVO_TRAJECTORIES:
+        source = result / source_name
+        if not source.is_file():
+            raise RuntimeError(f"cache recording requires Pure MACVO trajectory {source}")
+        shutil.copy2(source, destination / source_name)
     _atomic_write_json(
         destination / "provenance.json",
         {
@@ -205,6 +214,10 @@ def validate_visual_cache_bundle(cache_dir: str | Path, visual_factor: str | Non
         RelativePoseFactorCacheReader(cache)
     if factor in {None, "pace"}:
         CompressedUVDFactorCacheReader(cache)
+    for filename in PURE_MACVO_TRAJECTORIES.values():
+        trajectory = cache / filename
+        if not trajectory.is_file():
+            raise RuntimeError(f"visual cache is missing Pure MACVO trajectory: {trajectory}")
 
     ready_path = cache / CACHE_READY_FILENAME
     if ready_path.is_file():
@@ -250,10 +263,17 @@ def record_visual_factor_cache(
             dataset=dataset,
         )
         export_result_to_visual_cache(source, cache, str(scene), dataset)
+        for source_name, destination_name in PURE_MACVO_TRAJECTORIES.items():
+            shutil.copy2(source / source_name, cache / destination_name)
         relative = build_relative_cache(cache, force=True, huber_delta=3.0)
         compressed = build_compressed_cache(cache, force=True, huber_delta=0.1)
         reader = VisualFactorCacheReader(cache)
-        files = [cache / "manifest.json", relative, compressed]
+        files = [
+            cache / "manifest.json",
+            relative,
+            compressed,
+            *(cache / name for name in PURE_MACVO_TRAJECTORIES.values()),
+        ]
         _atomic_write_json(
             cache / CACHE_READY_FILENAME,
             {
@@ -263,6 +283,10 @@ def record_visual_factor_cache(
                 "frame_count": reader.manifest.frame_count,
                 "pair_count": len(reader.manifest.pairs),
                 "source_reference": "pure MACVO left-camera center",
+                "pure_macvo_trajectories": {
+                    "camera_center": PURE_MACVO_TRAJECTORIES["macvo_raw_poses_camera.csv"],
+                    "imu_center": PURE_MACVO_TRAJECTORIES["macvo_raw_poses_imu.csv"],
+                },
                 "sha256": {path.name: _sha256(path) for path in files},
             },
         )

@@ -5,6 +5,8 @@ import pytest
 
 from Scripts.run_paper_experiments import (
     METHODS,
+    _completed_result,
+    _publish_pure_macvo,
     build_cache_record_command,
     build_command,
 )
@@ -83,6 +85,57 @@ def test_paper_commands_record_once_then_replay_the_same_cache(tmp_path: Path):
     ]
     assert all(command[command.index("--visual-cache-mode") + 1] == "replay" for command in commands)
     assert all(command[command.index("--visual-cache-path") + 1] == str(cache.resolve()) for command in commands)
+
+
+def test_field_replay_disables_inline_paper_evaluation(tmp_path: Path):
+    dataset_path = tmp_path / "field"
+    dataset_path.mkdir()
+    dataset = {
+        "scenario": "Field",
+        "path": str(dataset_path),
+        "paper_evaluation": False,
+        "static_initialization": {"mode": "off"},
+    }
+    command = build_command(
+        dataset=dataset,
+        method=METHODS[-1],
+        output_root=tmp_path / "results",
+        model=tmp_path / "model.pth",
+        runtime={},
+        dry_run=True,
+        visual_cache_mode="replay",
+        visual_cache_path=tmp_path / "cache",
+    )
+    assert "--no-paper-evaluation" in command
+    assert "--paper-evaluation" not in command
+
+
+def test_no_evaluation_run_can_resume_from_execution_marker(tmp_path: Path):
+    result = tmp_path / "result"
+    result.mkdir()
+    (result / "run_execution.json").write_text(
+        '{"return_code": 0, "status": "ok"}',
+        encoding="utf-8",
+    )
+    assert _completed_result(result, paper_evaluation=False)
+    assert not _completed_result(result, paper_evaluation=True)
+
+
+def test_pure_macvo_trajectories_are_published_as_scene_artifacts(tmp_path: Path):
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    (cache / "pure_macvo_poses_camera.csv").write_text("timestamp_ns,tx\n1,0\n")
+    (cache / "pure_macvo_poses_imu.csv").write_text("timestamp_ns,tx\n1,0\n")
+    dataset_path = tmp_path / "circle"
+    dataset_path.mkdir()
+    destination = _publish_pure_macvo(
+        cache,
+        tmp_path / "results",
+        {"scenario": "Circle", "path": str(dataset_path)},
+    )
+    assert (destination / "poses_camera.csv").is_file()
+    assert (destination / "poses_imu.csv").is_file()
+    assert (destination / "manifest.json").is_file()
 
 
 def test_record_configuration_is_pure_visual(tmp_path: Path):

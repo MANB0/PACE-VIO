@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import shutil
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -39,6 +40,8 @@ METHODS = (
     MethodSpec("pace_isam2", "PACE-iSAM2", "isam2", "pace"),
     MethodSpec("pace_vio", "PACE-VIO", "isam2", "pace", "v2"),
 )
+
+VISUAL_CACHE_STAGE_KEY = "visual_cache"
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -70,7 +73,14 @@ def load_manifest(path: Path) -> dict[str, Any]:
             raise ValueError(f"{label}: fixed initialization requires duration_s > 0")
         if mode != "fixed" and duration is not None:
             raise ValueError(f"{label}: duration_s is valid only for fixed initialization")
+        paper_evaluation = item.get("paper_evaluation", True)
+        if not isinstance(paper_evaluation, bool):
+            raise ValueError(f"{label}: paper_evaluation must be a boolean")
     return manifest
+
+
+def _paper_evaluation_enabled(dataset: dict[str, Any]) -> bool:
+    return bool(dataset.get("paper_evaluation", True))
 
 
 def build_command(
@@ -101,8 +111,12 @@ def build_command(
         "--near-zero-velocity-detector", method.detector,
         "--static-init-mode", mode,
         "--no-live-display",
-        "--paper-evaluation",
     ]
+    command.append(
+        "--paper-evaluation"
+        if _paper_evaluation_enabled(dataset)
+        else "--no-paper-evaluation"
+    )
     if visual_cache_mode != "live":
         if visual_cache_path is None:
             raise ValueError(f"{visual_cache_mode} requires a visual cache path")
@@ -149,7 +163,12 @@ def build_cache_record_command(
         visual_cache_mode="record",
         visual_cache_path=cache_path,
     )
-    command[command.index("--paper-evaluation")] = "--no-paper-evaluation"
+    command = [
+        value
+        for value in command
+        if value not in {"--paper-evaluation", "--no-paper-evaluation"}
+    ]
+    command.append("--no-paper-evaluation")
     return command
 
 
@@ -160,6 +179,71 @@ def _shared_cache_path(cache_root: Path, dataset: dict[str, Any]) -> Path:
 
 def _result_dir(output_root: Path, dataset: dict[str, Any], method: MethodSpec) -> Path:
     return output_root / method.key / Path(str(dataset["path"])).expanduser().resolve().name
+
+
+def _append_status(
+    path: Path,
+    *,
+    scenario: str,
+    method: str,
+    status: str,
+    started: str,
+    finished: str,
+    log: Path,
+) -> None:
+    with path.open("a", newline="", encoding="utf-8") as stream:
+        csv.writer(stream).writerow(
+            (scenario, method, status, started, finished, log)
+        )
+
+
+def _completed_result(result_dir: Path, *, paper_evaluation: bool) -> bool:
+    if paper_evaluation:
+        return (result_dir / "paper_evaluation/metrics_summary.json").is_file()
+    execution = result_dir / "run_execution.json"
+    if not execution.is_file():
+        return False
+    try:
+        payload = _read_json(execution)
+    except (OSError, json.JSONDecodeError):
+        return False
+    return int(payload.get("return_code", -1)) == 0 and payload.get("status") == "ok"
+
+
+def _publish_pure_macvo(
+    cache_path: Path,
+    output_root: Path,
+    dataset: dict[str, Any],
+) -> Path:
+    dataset_name = Path(str(dataset["path"])).expanduser().resolve().name
+    destination = output_root / "pure_macvo" / dataset_name
+    destination.mkdir(parents=True, exist_ok=True)
+    files = {
+        "pure_macvo_poses_camera.csv": "poses_camera.csv",
+        "pure_macvo_poses_imu.csv": "poses_imu.csv",
+    }
+    for source_name, destination_name in files.items():
+        source = cache_path / source_name
+        if not source.is_file():
+            raise RuntimeError(f"visual cache is missing Pure MACVO output: {source}")
+        shutil.copy2(source, destination / destination_name)
+    (destination / "manifest.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "scenario": str(dataset["scenario"]),
+                "dataset": str(Path(str(dataset["path"])).expanduser().resolve()),
+                "visual_cache": str(cache_path.resolve()),
+                "camera_trajectory": "poses_camera.csv",
+                "imu_center_trajectory": "poses_imu.csv",
+            },
+            indent=2,
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return destination
 
 
 def _metric(summary: dict[str, Any], trajectory: str, *keys: str) -> Any:
@@ -179,6 +263,13 @@ def summarize(output_root: Path, manifest: dict[str, Any]) -> Path:
     for dataset in manifest["datasets"]:
         scenario = str(dataset["scenario"])
         bundles[scenario] = {}
+        pure_macvo = (
+            output_root
+            / "pure_macvo"
+            / Path(str(dataset["path"])).expanduser().resolve().name
+        )
+        if (pure_macvo / "poses_imu.csv").is_file():
+            bundles[scenario]["macvo"] = str(pure_macvo)
         for method in METHODS:
             result_dir = _result_dir(output_root, dataset, method)
             bundle = result_dir / "paper_evaluation"
@@ -334,29 +425,36 @@ def main() -> int:
 
     failed = False
     for dataset in manifest["datasets"]:
+        scenario = str(dataset["scenario"])
         shared_cache: Path | None = None
         cache_failed = False
         if args.visual_cache_policy == "shared":
             shared_cache = _shared_cache_path(cache_root, dataset)
+            cache_log = output_root / "logs" / scenario / f"{VISUAL_CACHE_STAGE_KEY}.log"
+            cache_log.parent.mkdir(parents=True, exist_ok=True)
+            cache_started = datetime.now(timezone.utc).isoformat()
             cache_valid = False
+            cache_status = "pending"
             if shared_cache.exists():
                 try:
                     from Scripts.record_visual_factor_cache import validate_visual_cache_bundle
 
                     validate_visual_cache_bundle(shared_cache)
                     cache_valid = True
+                    cache_status = "skipped_complete"
                     print(
-                        f"[{dataset['scenario']}] Visual cache: reuse {shared_cache}",
+                        f"[{scenario}] Visual cache: reuse {shared_cache}",
                         flush=True,
                     )
                 except Exception as error:
                     print(
-                        f"[{dataset['scenario']}] Existing visual cache is invalid: {error}",
+                        f"[{scenario}] Existing visual cache is invalid: {error}",
                         file=sys.stderr,
                         flush=True,
                     )
                     cache_failed = True
                     failed = True
+                    cache_status = "failed:invalid_cache"
             if not cache_valid and not cache_failed:
                 record_command = build_cache_record_command(
                     dataset=dataset,
@@ -367,12 +465,19 @@ def main() -> int:
                     dry_run=args.dry_run,
                 )
                 print(
-                    f"[{dataset['scenario']}] Visual cache: {' '.join(record_command)}",
+                    f"[{scenario}] Visual cache: {' '.join(record_command)}",
                     flush=True,
                 )
+                _append_status(
+                    status_path,
+                    scenario=scenario,
+                    method=VISUAL_CACHE_STAGE_KEY,
+                    status="running",
+                    started=cache_started,
+                    finished="",
+                    log=cache_log,
+                )
                 if not args.dry_run:
-                    cache_log = output_root / "logs" / str(dataset["scenario"]) / "visual_cache.log"
-                    cache_log.parent.mkdir(parents=True, exist_ok=True)
                     with cache_log.open("w", encoding="utf-8") as log:
                         process = subprocess.run(
                             record_command,
@@ -385,21 +490,54 @@ def main() -> int:
                     if process.returncode != 0:
                         cache_failed = True
                         failed = True
+                        cache_status = f"failed:{process.returncode}"
                         print(f"Visual cache recording failed; inspect {cache_log}", file=sys.stderr)
                     else:
                         from Scripts.record_visual_factor_cache import validate_visual_cache_bundle
 
                         validate_visual_cache_bundle(shared_cache)
+                        cache_valid = True
+                        cache_status = "ok"
+                else:
+                    cache_status = "ok"
+            if cache_valid and not args.dry_run:
+                try:
+                    pure_result = _publish_pure_macvo(shared_cache, output_root, dataset)
+                    print(f"[{scenario}] Pure MACVO: {pure_result}", flush=True)
+                except Exception as error:
+                    print(
+                        f"[{scenario}] Pure MACVO publication failed: {error}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    cache_failed = True
+                    failed = True
+                    cache_status = "failed:pure_macvo"
+            cache_finished = datetime.now(timezone.utc).isoformat()
+            _append_status(
+                status_path,
+                scenario=scenario,
+                method=VISUAL_CACHE_STAGE_KEY,
+                status=cache_status,
+                started=cache_started,
+                finished=cache_finished,
+                log=cache_log,
+            )
             if cache_failed:
                 if not args.continue_on_error:
                     return 1
                 continue
         for method in METHODS:
             result_dir = _result_dir(output_root, dataset, method)
-            completed = result_dir / "paper_evaluation/metrics_summary.json"
-            log_path = output_root / "logs" / str(dataset["scenario"]) / f"{method.key}.log"
+            paper_evaluation = _paper_evaluation_enabled(dataset)
+            completed = _completed_result(
+                result_dir,
+                paper_evaluation=paper_evaluation,
+            )
+            log_path = output_root / "logs" / scenario / f"{method.key}.log"
             log_path.parent.mkdir(parents=True, exist_ok=True)
-            if completed.is_file() and not args.no_resume and not args.dry_run:
+            method_failed = False
+            if completed and not args.no_resume and not args.dry_run:
                 status = "skipped_complete"
                 started = finished = datetime.now(timezone.utc).isoformat()
             else:
@@ -416,7 +554,16 @@ def main() -> int:
                     visual_cache_path=shared_cache,
                 )
                 started = datetime.now(timezone.utc).isoformat()
-                print(f"[{dataset['scenario']}] {method.paper_name}: {' '.join(command)}", flush=True)
+                print(f"[{scenario}] {method.paper_name}: {' '.join(command)}", flush=True)
+                _append_status(
+                    status_path,
+                    scenario=scenario,
+                    method=method.key,
+                    status="running",
+                    started=started,
+                    finished="",
+                    log=log_path,
+                )
                 if args.dry_run:
                     process = subprocess.CompletedProcess(command, 0)
                 else:
@@ -432,12 +579,18 @@ def main() -> int:
                 finished = datetime.now(timezone.utc).isoformat()
                 status = "ok" if process.returncode == 0 else f"failed:{process.returncode}"
                 if process.returncode != 0:
+                    method_failed = True
                     failed = True
-            with status_path.open("a", newline="", encoding="utf-8") as stream:
-                csv.writer(stream).writerow(
-                    (dataset["scenario"], method.key, status, started, finished, log_path)
-                )
-            if failed and not args.continue_on_error:
+            _append_status(
+                status_path,
+                scenario=scenario,
+                method=method.key,
+                status=status,
+                started=started,
+                finished=finished,
+                log=log_path,
+            )
+            if method_failed and not args.continue_on_error:
                 print(f"Experiment failed; inspect {log_path}", file=sys.stderr)
                 return 1
     if not args.dry_run:

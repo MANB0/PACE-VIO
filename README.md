@@ -230,6 +230,16 @@ python Scripts/run_paper_experiments.py \
   --manifest Config/paper_experiments.json
 ```
 
+The shared-cache paper runner is strictly scene-serial. For each manifest
+dataset it first records one complete pure-MACVO cache, publishes the raw
+camera-center and IMU-center trajectories under
+`OUTPUT/pure_macvo/<dataset>/`, and then replays that exact cache through
+Pose-iSAM2, UVD-iSAM2, PACE-Two, PACE-iSAM2, and PACE-VIO. It does not begin
+the next dataset until all five replays have finished. Datasets without
+`ref_pose.csv` set `paper_evaluation` to `false`; their trajectories are still
+saved and can be evaluated later with the field alignment contract. The web
+console on port 8766 displays the cache stage and all five replay stages.
+
 在 Slurm GPU 节点上可直接提交同一清单：
 
 ```bash
