@@ -30,6 +30,19 @@ fi
 
 cmake "${cmake_args[@]}"
 cmake --build "$BUILD_DIR" -j "${BUILD_JOBS:-$(nproc)}"
-ctest --test-dir "$BUILD_DIR" --output-on-failure
+
+gtsam_library_dir=""
+if [[ -n "${GTSAM_DIR:-}" && -d "$GTSAM_DIR" ]]; then
+  gtsam_prefix="$(cd "$GTSAM_DIR/../../.." && pwd)"
+  if [[ -d "$gtsam_prefix/lib" ]]; then
+    gtsam_library_dir="$gtsam_prefix/lib"
+  fi
+fi
+if [[ -n "$gtsam_library_dir" ]]; then
+  LD_LIBRARY_PATH="$gtsam_library_dir${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+    ctest --test-dir "$BUILD_DIR" --output-on-failure
+else
+  ctest --test-dir "$BUILD_DIR" --output-on-failure
+fi
 
 echo "PACE-VIO iSAM2 backend ready: $BUILD_DIR/python"
