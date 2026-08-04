@@ -330,6 +330,22 @@ def zero_translation_kinematic_evidence(
 
 
 @dataclass(frozen=True)
+class NearZeroVelocityThresholdsV2:
+    minimum_imu_angular_rate_rad_s: float = 0.40
+    minimum_visual_angular_rate_rad_s: float = 0.40
+    maximum_rotation_vector_rate_difference_rad_s: float = 0.05
+    minimum_rotation_axis_cosine: float = 0.995
+    maximum_zero_translation_nis_per_dof: float = 1.25
+    enter_hold_s: float = 0.20
+    release_hold_s: float = 0.10
+
+
+# Frozen from motion-label calibration on detector evidence only. Downstream
+# APE/RPE and optimized trajectory quality are deliberately excluded.
+FROZEN_NEAR_ZERO_VELOCITY_V2 = NearZeroVelocityThresholdsV2()
+
+
+@dataclass(frozen=True)
 class NearZeroVelocityDecisionV2:
     active: bool
     candidate: bool
@@ -362,13 +378,23 @@ class TurningNearZeroVelocityDetectorV2:
     def __init__(
         self,
         *,
-        minimum_imu_angular_rate_rad_s: float = 0.30,
-        minimum_visual_angular_rate_rad_s: float = 0.25,
-        maximum_rotation_vector_rate_difference_rad_s: float = 0.08,
-        minimum_rotation_axis_cosine: float = 0.90,
-        maximum_zero_translation_nis_per_dof: float = 3.5,
-        enter_hold_s: float = 0.20,
-        release_hold_s: float = 0.10,
+        minimum_imu_angular_rate_rad_s: float = (
+            FROZEN_NEAR_ZERO_VELOCITY_V2.minimum_imu_angular_rate_rad_s
+        ),
+        minimum_visual_angular_rate_rad_s: float = (
+            FROZEN_NEAR_ZERO_VELOCITY_V2.minimum_visual_angular_rate_rad_s
+        ),
+        maximum_rotation_vector_rate_difference_rad_s: float = (
+            FROZEN_NEAR_ZERO_VELOCITY_V2.maximum_rotation_vector_rate_difference_rad_s
+        ),
+        minimum_rotation_axis_cosine: float = (
+            FROZEN_NEAR_ZERO_VELOCITY_V2.minimum_rotation_axis_cosine
+        ),
+        maximum_zero_translation_nis_per_dof: float = (
+            FROZEN_NEAR_ZERO_VELOCITY_V2.maximum_zero_translation_nis_per_dof
+        ),
+        enter_hold_s: float = FROZEN_NEAR_ZERO_VELOCITY_V2.enter_hold_s,
+        release_hold_s: float = FROZEN_NEAR_ZERO_VELOCITY_V2.release_hold_s,
     ) -> None:
         values = (
             minimum_imu_angular_rate_rad_s,

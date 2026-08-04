@@ -3,6 +3,7 @@ from pathlib import Path
 import yaml
 
 from Scripts.run_realtime_t2 import configure_odom
+from Utility.NearZeroVelocityDetector import FROZEN_NEAR_ZERO_VELOCITY_V2
 
 
 def _configure(
@@ -46,18 +47,28 @@ def test_realtime_config_records_frozen_v2_contract(tmp_path):
     assert optimizer["two_state_near_zero_velocity_enable"] is True
     assert optimizer["two_state_near_zero_velocity_detector_version"] == "v2"
     assert optimizer["two_state_near_zero_velocity_prior_std_m_s"] == 0.01
-    assert (
-        optimizer[
-            "two_state_near_zero_velocity_v2_minimum_imu_angular_rate_rad_s"
-        ]
-        == 0.30
-    )
-    assert (
-        optimizer[
-            "two_state_near_zero_velocity_v2_maximum_zero_translation_nis_per_dof"
-        ]
-        == 3.5
-    )
+    frozen = FROZEN_NEAR_ZERO_VELOCITY_V2
+    assert optimizer[
+        "two_state_near_zero_velocity_v2_minimum_imu_angular_rate_rad_s"
+    ] == frozen.minimum_imu_angular_rate_rad_s
+    assert optimizer[
+        "two_state_near_zero_velocity_v2_minimum_visual_angular_rate_rad_s"
+    ] == frozen.minimum_visual_angular_rate_rad_s
+    assert optimizer[
+        "two_state_near_zero_velocity_v2_maximum_rotation_vector_rate_difference_rad_s"
+    ] == frozen.maximum_rotation_vector_rate_difference_rad_s
+    assert optimizer[
+        "two_state_near_zero_velocity_v2_minimum_rotation_axis_cosine"
+    ] == frozen.minimum_rotation_axis_cosine
+    assert optimizer[
+        "two_state_near_zero_velocity_v2_maximum_zero_translation_nis_per_dof"
+    ] == frozen.maximum_zero_translation_nis_per_dof
+    assert optimizer[
+        "two_state_near_zero_velocity_enter_hold_s"
+    ] == frozen.enter_hold_s
+    assert optimizer[
+        "two_state_near_zero_velocity_release_hold_s"
+    ] == frozen.release_hold_s
 
 
 def test_realtime_config_maps_all_visual_factor_names(tmp_path):

@@ -2,6 +2,7 @@ import pytest
 import torch
 
 from Utility.NearZeroVelocityDetector import (
+    FROZEN_NEAR_ZERO_VELOCITY_V2,
     TurningNearZeroVelocityDetector,
     TurningNearZeroVelocityDetectorV2,
     ZeroTranslationKinematicEvidence,
@@ -160,6 +161,29 @@ def test_v2_does_not_gate_on_drifted_estimated_speed():
     assert decisions[-1].entered
 
 
+def test_v2_defaults_match_frozen_calibration_contract():
+    detector = TurningNearZeroVelocityDetectorV2()
+    frozen = FROZEN_NEAR_ZERO_VELOCITY_V2
+
+    assert detector.minimum_imu_angular_rate_rad_s == (
+        frozen.minimum_imu_angular_rate_rad_s
+    )
+    assert detector.minimum_visual_angular_rate_rad_s == (
+        frozen.minimum_visual_angular_rate_rad_s
+    )
+    assert detector.maximum_rotation_vector_rate_difference_rad_s == (
+        frozen.maximum_rotation_vector_rate_difference_rad_s
+    )
+    assert detector.minimum_rotation_axis_cosine == (
+        frozen.minimum_rotation_axis_cosine
+    )
+    assert detector.maximum_zero_translation_nis_per_dof == (
+        frozen.maximum_zero_translation_nis_per_dof
+    )
+    assert detector.enter_hold_s == frozen.enter_hold_s
+    assert detector.release_hold_s == frozen.release_hold_s
+
+
 def test_v2_rejects_continuous_circle_angular_rate():
     detector = TurningNearZeroVelocityDetectorV2()
     decisions = [
@@ -177,6 +201,18 @@ def test_v2_rejects_large_zero_translation_nis():
         _v2_step(detector, nis_per_dof=4.0) for _ in range(20)
     ]
 
+    assert not any(decision.active for decision in decisions)
+    assert "zero_translation_nis" in decisions[-1].reason
+
+
+def test_v2_rejects_smooth_moving_turn_evidence_near_nis_boundary():
+    detector = TurningNearZeroVelocityDetectorV2()
+    decisions = [
+        _v2_step(detector, imu_rate=0.55, visual_rate=0.54, nis_per_dof=1.30)
+        for _ in range(20)
+    ]
+
+    assert not any(decision.candidate for decision in decisions)
     assert not any(decision.active for decision in decisions)
     assert "zero_translation_nis" in decisions[-1].reason
 

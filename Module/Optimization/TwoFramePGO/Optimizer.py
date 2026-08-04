@@ -26,6 +26,7 @@ from Utility.RelativePoseFactorCache import camera_factor_to_body_factor
 from Utility.PACEFactorPacket import PACEFactorPacket
 from Utility.PACEISAM2Backend import IncrementalPACEISAM2Backend
 from Utility.NearZeroVelocityDetector import (
+    FROZEN_NEAR_ZERO_VELOCITY_V2,
     TurningNearZeroVelocityDetector,
     TurningNearZeroVelocityDetectorV2,
     zero_translation_kinematic_evidence,
@@ -2569,49 +2570,49 @@ class TwoFrame_PGO(IOptimizer[GraphInput, dict, GraphOutput]):
                     getattr(
                         config,
                         "two_state_near_zero_velocity_v2_minimum_imu_angular_rate_rad_s",
-                        0.30,
+                        FROZEN_NEAR_ZERO_VELOCITY_V2.minimum_imu_angular_rate_rad_s,
                     )
                 ),
                 minimum_visual_angular_rate_rad_s=float(
                     getattr(
                         config,
                         "two_state_near_zero_velocity_v2_minimum_visual_angular_rate_rad_s",
-                        0.25,
+                        FROZEN_NEAR_ZERO_VELOCITY_V2.minimum_visual_angular_rate_rad_s,
                     )
                 ),
                 maximum_rotation_vector_rate_difference_rad_s=float(
                     getattr(
                         config,
                         "two_state_near_zero_velocity_v2_maximum_rotation_vector_rate_difference_rad_s",
-                        0.08,
+                        FROZEN_NEAR_ZERO_VELOCITY_V2.maximum_rotation_vector_rate_difference_rad_s,
                     )
                 ),
                 minimum_rotation_axis_cosine=float(
                     getattr(
                         config,
                         "two_state_near_zero_velocity_v2_minimum_rotation_axis_cosine",
-                        0.90,
+                        FROZEN_NEAR_ZERO_VELOCITY_V2.minimum_rotation_axis_cosine,
                     )
                 ),
                 maximum_zero_translation_nis_per_dof=float(
                     getattr(
                         config,
                         "two_state_near_zero_velocity_v2_maximum_zero_translation_nis_per_dof",
-                        3.5,
+                        FROZEN_NEAR_ZERO_VELOCITY_V2.maximum_zero_translation_nis_per_dof,
                     )
                 ),
                 enter_hold_s=float(
                     getattr(
                         config,
                         "two_state_near_zero_velocity_enter_hold_s",
-                        0.20,
+                        FROZEN_NEAR_ZERO_VELOCITY_V2.enter_hold_s,
                     )
                 ),
                 release_hold_s=float(
                     getattr(
                         config,
                         "two_state_near_zero_velocity_release_hold_s",
-                        0.10,
+                        FROZEN_NEAR_ZERO_VELOCITY_V2.release_hold_s,
                     )
                 ),
             )
