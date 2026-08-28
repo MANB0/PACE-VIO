@@ -1,21 +1,19 @@
 # PACE-VIO
 
 **PACE-VIO**（Pointwise Uncertainty-Aware Compressed Estimation for
-Visual-Inertial Odometry）是经过裁切的实时双目视觉惯性里程计工程。运行顺序固定为：
+Visual-Inertial Odometry）是一套面向实时水下定位与论文复现的双目视觉惯性里程计方法。运行顺序固定为：
 
 ```text
-双目图像 -> MACVO 前端 -> PACE 压缩 UVD 视觉因子
+双目图像 -> MAC-VO 前端 -> PACE 压缩 UVD 视觉因子
 原始 IMU  -> 局部坐标系预积分 ---------------------> 两状态或 iSAM2 后端
                                                     -> IMU 中心轨迹 + 实时网页
 ```
 
 ## 唯一实现
 
-当前默认分支是本项目唯一维护和发布的实现，也是后续修改的唯一源码基线。仓库中的历史完整分支和冻结标签只用于审计、差异比较与灾难恢复，不属于另一套可并行演进的产品代码。
+当前 `main` 分支是本项目唯一维护和发布的实现，也是后续修改的唯一源码基线。仓库中的历史冻结标签只用于审计、差异比较与灾难恢复，不属于另一套并行实现。
 
-因此，后续功能必须直接在本实现中完成并通过本仓库测试；不得依赖 `macvo-dev` 的实验脚本、历史视觉缓存或完整分支中的隐式运行路径。
-
-该分支不读取视觉缓存。MACVO 必须先完成当前帧对的视觉计算，PACE-VIO 后端随后使用同一帧对的视觉量和对应时间区间 IMU。网页显示独立的 `MACVO raw`、`VIO committed` 和可选 GT，并支持轨迹缩放/拖动、双目图像、IMU 曲线及运行中回放。
+实现提供三种显式视觉前端模式：`live` 直接在线运行 MAC-VO，`record` 运行一次前端并保存完整视觉缓存，`replay` 则为受控对比实验确定性地复用该缓存。PACE-VIO 后端使用同一帧对的视觉量和对应时间区间 IMU；网页显示独立的 `MAC-VO raw`、`VIO committed` 和可选 GT，并支持轨迹缩放、拖动、双目图像、IMU 曲线及运行中回放。
 
 公开名称、实现变体及旧接口兼容范围见
 [PACE-VIO 生产仓库命名契约](docs/PACE_VIO_NAMING_AUDIT_CN.md)。
@@ -27,14 +25,13 @@ Visual-Inertial Odometry）是经过裁切的实时双目视觉惯性里程计�
 - PyTorch 2.4.0，PyPose 0.9.5
 - 640x480 双目图像至少约 6 GB VRAM
 
-CPU 负责 PACE-VIO 后端求解，GPU 负责 MACVO 神经网络前端。没有 CUDA GPU 时当前前端不能运行。
+CPU 负责 PACE-VIO 后端求解，GPU 负责 MAC-VO 神经网络前端。没有 CUDA GPU 时当前前端不能运行。
 
 ## 1. Clone 与环境
 
 ```bash
-git clone --depth 1 --branch codex/realtime-minimal \
-  https://github.com/MANB0/macvo-realtime-t2-vio.git
-cd macvo-realtime-t2-vio
+git clone --depth 1 https://github.com/MANB0/PACE-VIO.git
+cd PACE-VIO
 bash Scripts/bootstrap_conda.sh pace-vio
 conda activate pace-vio
 ```
@@ -170,13 +167,13 @@ python Scripts/run_pace_vio.py \
 - PACE-VIO 默认使用 `two_state_fixed_lag + compressed_uvd`，不是 T0 相对位姿因子。
 - 四个连续时间 IMU 噪声密度和相机/IMU 外参从 `metadata.json` 读取；离散化使用 CSV 纳秒时间戳，不依赖名义采样频率。
 
-### 固定 MACVO 视觉输入
+### 固定 MAC-VO 视觉输入
 
 同一数据集上的消融实验应先录制一次视觉缓存，再让所有后端和视觉因子回放
 同一份观测，避免神经网络重复推理造成输入差异。三个模式互斥：
 
 ```bash
-# 1. 单独运行 MACVO 并生成完整 NPZ 视觉缓存
+# 1. 单独运行 MAC-VO 并生成完整 NPZ 视觉缓存
 python Scripts/run_pace_vio.py \
   --dataset /absolute/path/to/sequence \
   --output Results/cache_record \
@@ -200,16 +197,16 @@ python Scripts/run_pace_vio.py \
 ```
 
 `record` 和 `replay` 只接受完整序列。缓存主体采用 NPZ，包含原始 UVD
-观测、协方差、纯 MACVO 左目中心位姿以及 Pose/PACE 因子旁路数据；CSV
+观测、协方差、纯 MAC-VO 左目中心位姿以及 Pose/PACE 因子旁路数据；CSV
 仅保留为人工检查和来源追踪文件。回放前会核对场景名、帧数、时间戳、内参、
 基线和 SHA-256。论文批处理默认对每个场景录制一次并共享回放；如确需恢复
 旧的独立前端运行，可传入 `--visual-cache-policy live`。
 
-## 历史回退
+## 开源版本与历史回退
 
-私有仓库 `main` 和标签 `realtime-t2-full-20260721` 保存裁切前的只读快照；它们不是当前实现，也不接受独立功能开发。需要恢复历史代码时，应先逐文件审计，再把必要改动移植到当前默认分支并运行本仓库回归测试。
+论文投稿对应的源码由标签 `paper-v1.0` 固定。较早的实时 T2 快照保存在 `realtime-t2-full-20260721` 等历史标签中；它们仅用于审计与回退，不是当前实现，也不接受独立功能开发。
 
-本工程基于 MAC-VO，许可证见 [LICENSE](LICENSE)。模型来自 [MAC-VO model release](https://github.com/MAC-VO/MAC-VO/releases/tag/model)。
+本工程基于 MAC-VO，沿用并保留其 MIT 许可证，详见 [LICENSE](LICENSE)。前端模型来自 [MAC-VO model release](https://github.com/MAC-VO/MAC-VO/releases/tag/model)，不随本仓库提交，由环境脚本下载并校验。
 
 ## 旧名称兼容
 
@@ -220,7 +217,7 @@ C++ 扩展 ABI 暂时保留兼容入口，但不再作为论文、界面或新�
 
 ## 论文全量重跑
 
-环境脚本会同时准备 MACVO 前端、项目本地 GTSAM 和 PACE-VIO iSAM2
+环境脚本会同时准备 MAC-VO 前端、项目本地 GTSAM 和 PACE-VIO iSAM2
 扩展。当前论文协议固定使用 `Circle`、`Figure-eight` 和 `Rectangle` 三个
 2x 全量序列。复制 `Config/paper_experiments.example.json` 为
 `Config/paper_experiments.json`，只修改其中三个数据集路径，然后执行：
@@ -231,7 +228,7 @@ python Scripts/run_paper_experiments.py \
 ```
 
 The shared-cache paper runner is strictly scene-serial. For each manifest
-dataset it first records one complete pure-MACVO cache, publishes the raw
+dataset it first records one complete pure MAC-VO cache, publishes the raw
 camera-center and IMU-center trajectories under
 `OUTPUT/pure_macvo/<dataset>/`, and then replays that exact cache through
 Pose-iSAM2, UVD-iSAM2, PACE-Two, PACE-iSAM2, and PACE-VIO. It does not begin
